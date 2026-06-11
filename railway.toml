@@ -1,0 +1,13 @@
+# Railway service config. The volume must be mounted at FILE_STORAGE_DIR (e.g. /data/bom-files).
+[build]
+builder = "nixpacks"
+
+# LibreOffice is required for xlsx formula recalc. nixpacks needs it added as an apt package.
+[build.nixpacksPlan.phases.setup]
+aptPkgs = ["libreoffice-calc"]
+
+[deploy]
+startCommand = "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+healthcheckPath = "/healthz"
+healthcheckTimeout = 120
+restartPolicyType = "on_failure"
