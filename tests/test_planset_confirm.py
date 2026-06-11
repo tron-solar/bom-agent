@@ -59,6 +59,47 @@ def test_middle_name_customer():
         select_planset(files, "Joseph Michael Dare")
 
 
+def _pdf_sz(name, size, fid, created, url="http://x"):
+    return {"id": fid, "name": name, "url": url, "createdAt": created,
+            "metaData": {"extention": ".pdf", "size": size}}
+
+
+def test_identical_reupload_collapses_to_one():
+    # The real Joseph Dare case: same name + same byte size, two ids, ~18h apart (manual + form).
+    files = [
+        _pdf_sz("Joseph Dare REVA.pdf", 9242120, 10715409, "2026-06-04T15:58:40-05:00"),
+        _pdf_sz("Joseph Dare REVA.pdf", 9242120, 10728748, "2026-06-05T09:40:58-05:00"),
+    ]
+    got = select_planset(files, "Joseph Dare")
+    assert got.name == "Joseph Dare REVA.pdf" and got.revision == "A"
+    assert got.file["id"] == 10715409                      # earliest-created kept; later re-upload dropped
+    collapsed = got.diagnostics["duplicates_collapsed"]
+    assert len(collapsed) == 1 and collapsed[0]["dropped_ids"] == [10728748]
+    assert "ambiguous_at_top_revision" not in got.diagnostics
+
+
+def test_different_size_same_rev_is_flagged_ambiguous():
+    # Same name + REV but DIFFERENT size -> genuinely different files -> not collapsed, surfaced.
+    files = [
+        _pdf_sz("Joseph Dare REVA.pdf", 9242120, 1, "2026-06-04T00:00:00-05:00"),
+        _pdf_sz("Joseph Dare REVA.pdf", 5000000, 2, "2026-06-05T00:00:00-05:00"),
+    ]
+    got = select_planset(files, "Joseph Dare")
+    assert "ambiguous_at_top_revision" in got.diagnostics
+    assert len(got.diagnostics["ambiguous_at_top_revision"]) == 2
+    assert not got.diagnostics["duplicates_collapsed"]
+
+
+def test_higher_revision_still_wins_over_duplicated_lower():
+    # Dedupe must not interfere with revision precedence: REVB wins even if REVA is duplicated.
+    files = [
+        _pdf_sz("Joseph Dare REVA.pdf", 100, 1, "2026-06-01T00:00:00-05:00"),
+        _pdf_sz("Joseph Dare REVA.pdf", 100, 2, "2026-06-02T00:00:00-05:00"),
+        _pdf_sz("Joseph Dare REVB.pdf", 200, 3, "2026-06-03T00:00:00-05:00"),
+    ]
+    assert select_planset(files, "Joseph Dare").revision == "B"
+
+
 def test_content_confirmation_flags():
     assert confirm_planset_content("JOSEPH DARE 114 N JENNETTE ST", "Joseph Dare",
                                    "114 N Jennette St, Enfield, IL") == []

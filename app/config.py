@@ -26,7 +26,8 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         return cls(
-            coperniq_api_base=os.environ.get("COPERNIQ_API_BASE", "https://api.coperniq.io").rstrip("/"),
+            # Coperniq's REST API is versioned under /v1 (confirmed live: bare host 403s, /v1 works).
+            coperniq_api_base=os.environ.get("COPERNIQ_API_BASE", "https://api.coperniq.io/v1").rstrip("/"),
             coperniq_api_key=os.environ.get("COPERNIQ_API_KEY", ""),
             coperniq_webhook_secret=os.environ.get("COPERNIQ_WEBHOOK_SECRET", ""),
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),

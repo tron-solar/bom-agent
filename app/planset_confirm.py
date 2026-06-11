@@ -71,6 +71,11 @@ def _is_pdf(f: dict) -> bool:
     return name.endswith(".pdf") or ext == ".pdf" or "pdf" in mime
 
 
+def _file_size(f: dict) -> Optional[int]:
+    sz = (f.get("metaData", {}) or {}).get("size")
+    return sz if isinstance(sz, int) else None
+
+
 def revision_letter(filename: str) -> str:
     """Extract the revision letter. Accepts 'REVA', 'REV A', 'REV-A', 'REV_A' (case-insensitive).
     Returns the single letter or '' if none. Requires the REV token to be followed by ONE letter
@@ -134,6 +139,43 @@ def build_candidates(files: list[dict], customer_name: str) -> list[PlansetCandi
     return cands
 
 
+def _dedupe_by_content(cands: list[PlansetCandidate]) -> tuple[list[PlansetCandidate], list[dict]]:
+    """Collapse byte-identical re-uploads (same normalized name + same size) into ONE candidate.
+
+    A planset uploaded twice — e.g. a manual Engineering upload plus a "Plansets / RFD (Coperniq)"
+    form / "CAD (most recent rev)" submission of the *identical* PDF — appears as two file objects
+    with no shared id and no form/field provenance in the files API. Identical `metaData.size` is the
+    only content signal the API gives us (it returns no content hash), so we treat same-name +
+    same-size as the same document and keep the EARLIEST-created copy as the representative (the
+    original; the later form re-upload is the duplicate the user wants forgotten).
+
+    Candidates with no size are never collapsed — we can't assert identity, so they pass through
+    untouched. Returns (deduped, collapsed) where `collapsed` lists each merged group for diagnostics.
+    """
+    groups: dict[tuple, list[PlansetCandidate]] = {}
+    deduped: list[PlansetCandidate] = []
+    for c in cands:
+        sz = _file_size(c.file)
+        if sz is None:
+            deduped.append(c)          # unknown size -> can't prove identity, keep as-is
+            continue
+        groups.setdefault((_norm(_stem(c.name)), sz), []).append(c)
+    collapsed: list[dict] = []
+    for members in groups.values():
+        # representative = earliest createdAt, then smallest id (deterministic; drops later re-uploads)
+        members.sort(key=lambda c: (str(c.file.get("createdAt", "")), str(c.file.get("id", ""))))
+        deduped.append(members[0])
+        if len(members) > 1:
+            collapsed.append({
+                "name": members[0].name,
+                "size": _file_size(members[0].file),
+                "kept_id": members[0].file.get("id"),
+                "dropped_ids": [m.file.get("id") for m in members[1:]],
+                "count": len(members),
+            })
+    return deduped, collapsed
+
+
 @dataclass
 class ConfirmedPlanset:
     file: dict
@@ -159,14 +201,18 @@ def select_planset(files: list[dict], customer_name: str,
       - if a convention match has no resolvable URL -> raise
     """
     cands = build_candidates(files, customer_name)
-    matches = [c for c in cands if c.name_match]
+    matches_all = [c for c in cands if c.name_match]
+    # Collapse identical re-uploads (e.g. manual upload + form/RFD submission of the same PDF) so a
+    # byte-identical duplicate doesn't read as a genuine same-revision ambiguity.
+    matches, collapsed = _dedupe_by_content(matches_all)
 
     diag = {
         "customer_name": customer_name,
         "engineering_scoped": engineering_only,
         "total_files": len(files),
         "pdf_count": sum(1 for c in cands if c.is_pdf),
-        "convention_matches": [c.name for c in matches],
+        "convention_matches": [c.name for c in matches_all],
+        "duplicates_collapsed": collapsed,
         "all_pdf_names": [c.name for c in cands if c.is_pdf],
     }
 
@@ -180,11 +226,20 @@ def select_planset(files: list[dict], customer_name: str,
             diagnostics=diag,
         )
 
-    # pick highest revision; ties (shouldn't happen) -> most recent createdAt
+    # pick highest revision; ties (shouldn't happen after dedupe) -> most recent createdAt
     matches.sort(key=lambda c: (c.rev_index, c.file.get("createdAt", "")), reverse=True)
     best = matches[0]
     diag["selected"] = best.name
     diag["selected_revision"] = best.revision
+
+    # Residual ambiguity: >1 DISTINCT file (different size, so not collapsed) at the top revision.
+    # Dedupe removed identical re-uploads; anything left here is genuinely different content sharing
+    # the same name+REV — surface it for human review rather than trusting the createdAt tie-break.
+    top = [c for c in matches if c.rev_index == best.rev_index]
+    if len(top) > 1:
+        diag["ambiguous_at_top_revision"] = [
+            {"name": c.name, "id": c.file.get("id"), "size": _file_size(c.file)} for c in top
+        ]
 
     url = _file_url(best.file)
     if not url:
