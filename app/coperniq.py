@@ -29,9 +29,9 @@ class CoperniqClient:
         self.timeout = timeout
 
     def _headers(self) -> dict[str, str]:
-        # ALIGN WITH YOUR EXISTING HANDLERS. Common schemes:
-        #   {"Authorization": f"Bearer {self.api_key}"}  or  {"x-api-key": self.api_key}
-        return {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        # Coperniq authenticates with the `x-api-key` header (confirmed against the live API in
+        # coperniq_files_pagination_probe.py and the Coperniq docs), NOT Bearer.
+        return {"x-api-key": self.api_key, "Content-Type": "application/json"}
 
     # ---------- READ ----------
     def get_project(self, project_id: str, include_virtual: bool = True) -> dict:
