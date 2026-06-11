@@ -67,28 +67,53 @@ def test_content_confirmation_flags():
     assert "planset_name_mismatch" in items
 
 
-# --- pagination (the 20-file cap fix) ---
-def test_page_loop_pulls_all_pages_past_20_cap():
-    from app.coperniq import CoperniqClient
-    ALL = [{"id": 1000 + i, "name": f"f{i}.pdf"} for i in range(35)]
-    ALL.append({"id": 99999, "name": "Joseph Dare REVA.pdf"})
+# --- pagination (the page_size/page cap fix; confirmed scheme) ---
+def test_list_project_files_pages_through_page_size_cap(monkeypatch):
+    from app import coperniq as cq
 
-    def fake_call(params=None):
-        params = params or {}
-        if "page" in params:
-            size = params.get("limit", 20)
-            start = (params["page"] - 1) * size
-            return ALL[start:start + size]
-        return ALL[:20]
+    # Simulate Coperniq: hard 100/page cap, ?page_size & ?page honored; planset on page 2.
+    ALL = [{"id": 10248746 + i, "name": f"f{i}.pdf"} for i in range(140)]
+    ALL.append({"id": 10999999, "name": "Joseph Dare REVA.pdf"})  # 141st file -> page 2
 
-    got = CoperniqClient._page_loop(fake_call, "page", 20, start=1)
-    assert len(got) == 36
-    assert any("REVA" in f["name"] for f in got)
+    class FakeResp:
+        def __init__(self, data): self._d = data
+        def raise_for_status(self): pass
+        def json(self): return self._d
+
+    class FakeClient:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, url, headers=None, params=None):
+            size = min(params.get("page_size", 100), 100)
+            page = params.get("page", 1)
+            start = (page - 1) * size
+            return FakeResp(ALL[start:start + size])
+
+    monkeypatch.setattr(cq.httpx, "Client", FakeClient)
+    client = cq.CoperniqClient(base="http://x", api_key="k")
+    files = client.list_project_files("868257")
+    assert len(files) == 141
+    assert any("REVA" in f["name"] for f in files)
 
 
-def test_page_loop_stops_when_param_ignored():
-    from app.coperniq import CoperniqClient
-    ALL = [{"id": i, "name": f"f{i}.pdf"} for i in range(20)]
-    # API ignores page param -> always returns same 20 -> loop must not infinite-loop
-    got = CoperniqClient._page_loop(lambda params=None: ALL, "page", 20, start=1)
-    assert len(got) == 20
+def test_list_project_files_stops_on_repeated_page(monkeypatch):
+    from app import coperniq as cq
+    ALL = [{"id": i, "name": f"f{i}.pdf"} for i in range(50)]
+
+    class FakeResp:
+        def __init__(self, data): self._d = data
+        def raise_for_status(self): pass
+        def json(self): return self._d
+
+    class FakeClient:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, url, headers=None, params=None):
+            return FakeResp(ALL[:50])  # ignores page -> always same 50; must not loop forever
+
+    monkeypatch.setattr(cq.httpx, "Client", FakeClient)
+    client = cq.CoperniqClient(base="http://x", api_key="k")
+    files = client.list_project_files("1")
+    assert len(files) == 50  # got the page, detected no-progress, stopped

@@ -42,99 +42,41 @@ class CoperniqClient:
             return r.json()
 
     def list_project_files(self, project_id: str) -> list[dict]:
-        """Return ALL files on a project, paging through Coperniq's 20-file cap.
+        """Return ALL files on a project, paging through Coperniq's per-page cap.
 
-        CONFIRMED: GET /v1/projects/{id}/files returns at most 20 files per call (a page cap),
-        ordered by id ascending = oldest first. A manually-uploaded planset (newer, higher id)
-        lands on a later page and is INVISIBLE to a single call. This method pages until the full
-        set is retrieved, so the planset matcher sees every file.
+        CONFIRMED SCHEME (probe against live API, project 868257):
+          - the page-size param is `page_size` (NOT limit/pageSize/per_page/size)
+          - Coperniq enforces a HARD MAX of 100 files per page even if you request more
+          - the page param is `page` (1-indexed); ?page=2 returns the next distinct set
+        So we loop ?page_size=100&page=N until a short/empty page. A manually-uploaded planset
+        (newer, higher id) can be on page 2, 3, ... — a single call (first 20) never sees it,
+        which was the whole bug.
 
-        The endpoint's paging params are undocumented; `coperniq_files_pagination_probe.py`
-        discovers the real one. This method supports the common schemes and is controlled by
-        env var COPERNIQ_FILES_PAGING (default "auto"):
-          - "auto"   : try page-size=200; if still capped at 20, fall back to id-cursor paging
-          - "page"   : ?page=N&limit=PAGE_SIZE
-          - "offset" : ?offset=N&limit=PAGE_SIZE
-          - "none"   : single call (old behavior)
+        Override via env if Coperniq changes this: COPERNIQ_FILES_PAGE_SIZE (default 100).
         """
         import os
-        scheme = os.environ.get("COPERNIQ_FILES_PAGING", "auto")
-        page_size = int(os.environ.get("COPERNIQ_FILES_PAGE_SIZE", "200"))
-
-        def _call(params=None):
-            with httpx.Client(timeout=self.timeout) as c:
+        page_size = min(int(os.environ.get("COPERNIQ_FILES_PAGE_SIZE", "100")), 100)
+        out, seen = [], set()
+        page = 1
+        with httpx.Client(timeout=self.timeout) as c:
+            for _ in range(200):  # safety cap: 200 pages * 100 = 20k files
                 r = c.get(f"{self.base}/projects/{project_id}/files",
-                          headers=self._headers(), params=params or {})
+                          headers=self._headers(),
+                          params={"page": page, "page_size": page_size})
                 r.raise_for_status()
                 data = r.json()
-            if isinstance(data, dict):
-                for k in ("items", "data", "files", "results"):
-                    if k in data:
-                        return data[k]
-                return []
-            return data
-
-        if scheme == "none":
-            return _call()
-
-        if scheme == "page":
-            return self._page_loop(_call, "page", page_size, start=1)
-        if scheme == "offset":
-            return self._page_loop(_call, "offset", page_size, start=0)
-
-        # auto: 1) try a big page size in one shot
-        big = _call({"limit": page_size, "pageSize": page_size})
-        if len(big) > 20:
-            return big  # page-size param honored; got everything (or a much larger page)
-        # 2) page-size ignored -> page through with page=N (most common), then offset as fallback
-        paged = self._page_loop(_call, "page", 20, start=1)
-        if len(paged) > 20:
-            return paged
-        offset_paged = self._page_loop(_call, "offset", 20, start=0)
-        if len(offset_paged) > len(big):
-            return offset_paged
-        # 3) nothing exceeded the cap: id-cursor fallback (ascending id) if API supports it,
-        #    else return what we have and let the matcher raise (fail-closed, never wrong file).
-        return self._id_cursor_loop(_call) or big
-
-    @staticmethod
-    def _page_loop(_call, param, size, start):
-        """Generic page/offset loop. Stops on empty page, short page, or a repeat (no progress)."""
-        out, seen_ids = [], set()
-        idx = start
-        for _ in range(100):  # hard safety cap (100 pages)
-            params = {"limit": size, ("page" if param == "page" else "offset"): idx}
-            batch = _call(params)
-            if not batch:
-                break
-            new = [f for f in batch if f.get("id") not in seen_ids]
-            if not new:
-                break  # no progress -> param ignored
-            out.extend(new)
-            seen_ids.update(f.get("id") for f in new)
-            if len(batch) < size:
-                break  # last (short) page
-            idx += (1 if param == "page" else size)
-        return out
-
-    @staticmethod
-    def _id_cursor_loop(_call):
-        """Last-resort: if the API accepts an id cursor (after/since), page by ascending id."""
-        out, seen = [], set()
-        after = None
-        for _ in range(100):
-            params = {}
-            if after is not None:
-                params = {"after": after, "since_id": after, "afterId": after}
-            batch = _call(params or None)
-            new = [f for f in batch if f.get("id") not in seen]
-            if not new:
-                break
-            out.extend(new)
-            seen.update(f.get("id") for f in new)
-            after = max(f.get("id") for f in new if isinstance(f.get("id"), int))
-            if len(batch) < 20:
-                break
+                batch = data if isinstance(data, list) else (
+                    data.get("items") or data.get("data") or data.get("files") or [])
+                if not batch:
+                    break
+                new = [f for f in batch if f.get("id") not in seen]
+                if not new:
+                    break  # no progress (defensive: param ignored / repeated page)
+                out.extend(new)
+                seen.update(f.get("id") for f in new)
+                if len(batch) < page_size:
+                    break  # last page
+                page += 1
         return out
 
     def get_project_file(self, project_id: str, file_id: Any) -> dict:

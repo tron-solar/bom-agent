@@ -2,10 +2,15 @@
 """
 Coperniq files pagination diagnostic.
 
-WHY: GET /v1/projects/{id}/files returns a 20-file page cap (confirmed: exactly 20 files,
-IDs ascending, the manually-uploaded planset absent). The Coperniq docs list NO pagination
-params for this endpoint, so we must discover which convention it uses. This script probes the
-common ones and reports which (if any) returns more than 20 files / a different page.
+RESULT (confirmed against live API, project 868257):
+  The paging params are `page` + `page_size`. Coperniq enforces a HARD MAX of 100 files/page
+  (?page_size=200 returned 100; ?page=2 returned a distinct set). The single-call default returns
+  only the first 20, which is why manually-uploaded plansets (newer/higher id, on later pages)
+  were invisible. FIX (live in app/coperniq.py): loop ?page=N&page_size=100 until a short page.
+  This script is kept for re-verification if Coperniq changes the scheme.
+
+WHY: GET /v1/projects/{id}/files returns a small first page by default. The Coperniq docs list NO
+pagination params for this endpoint, so this probes the common ones and reports which works.
 
 SECURITY: pass your key via env var. Never hard-code it. Nothing here logs the key.
     export COPERNIQ_API_KEY="...your key..."
