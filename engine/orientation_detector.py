@@ -67,6 +67,41 @@ def _cluster(idx, gap):
     return out
 
 
+def _segment_by_gaps(vseps, cell_w, *, gap_factor=1.4):
+    """Split a band's cells into CONTIGUOUS RUNS (user, Meyer #877571).
+
+    A 'row' is a MAXIMAL CONTIGUOUS horizontal run of modules along a rail line. Within a detected
+    band, adjacent module cells share a vertical separator; a real GAP (missing module / spacing
+    between separate runs) shows up as an inter-cell pitch much larger than the typical cell width.
+    Each contiguous run becomes its OWN qualified row — interrupted/'retired' rows no longer exist;
+    a gap simply yields MORE rows.
+
+    vseps  : sorted x-positions of vertical separators (len = n_cells+1)
+    cell_w : [vseps[j+1]-vseps[j]] widths (len = n_cells)
+    Returns a list of runs; each run is a list of cell indices (into cell_w) that are contiguous.
+    A run boundary is declared where a cell's width exceeds gap_factor * median true-cell width
+    (i.e. that 'cell' is actually empty space between two runs).
+    """
+    if not cell_w:
+        return []
+    import statistics
+    # true module cells cluster around the median width; a gap span is markedly wider.
+    med = statistics.median(cell_w)
+    runs, cur = [], []
+    for j, w in enumerate(cell_w):
+        if w > gap_factor * med and cur:
+            # this 'cell' is a gap between runs -> close current run, skip the gap cell
+            runs.append(cur)
+            cur = []
+            continue
+        if w > gap_factor * med and not cur:
+            continue  # leading gap, ignore
+        cur.append(j)
+    if cur:
+        runs.append(cur)
+    return runs
+
+
 def detect_rows_and_orientations(rotated_img, *, min_line_frac=0.30, min_sep_frac=0.45,
                                  cluster_gap=20, sep_gap=18):
     """Detect module cells in the SOUTH-rotated raster and classify each per orientation.
@@ -78,6 +113,12 @@ def detect_rows_and_orientations(rotated_img, *, min_line_frac=0.30, min_sep_fra
 
     Classification is PER CELL from its own w/h. A single band can therefore contain a mix,
     which split_physical_row() will break into separate make_row() rows downstream.
+
+    SEGMENTATION (user, Meyer #877571): a band is additionally split into CONTIGUOUS RUNS wherever
+    modules are not adjacent. A horizontal gap inside a band ends one qualified row and starts the
+    next, so e.g. a top tier of [6]-gap-[2]-gap-[1] becomes THREE rows, not one row of 9. Counting
+    horizontal rail RUNS is NOT how rows are counted (each row carries two rail runs); rows come
+    only from contiguous module segmentation.
     """
     rgb = np.array(rotated_img.convert("RGB"))
     blue = _blue_mask(rgb)
@@ -107,20 +148,24 @@ def detect_rows_and_orientations(rotated_img, *, min_line_frac=0.30, min_sep_fra
         if len(vseps) < 2:
             continue  # not a real cell row (e.g. a gap band between staggered rows)
         cell_w = [vseps[j + 1] - vseps[j] for j in range(len(vseps) - 1)]
-        orientations, dims_in = [], []
-        for w in cell_w:
-            orient = "portrait" if band_h > w else "landscape"
-            orientations.append(orient)
-            edge = LONG_IN if orient == "landscape" else SHORT_IN
-            # the cell's drawn width in inches IS the edge along the rail for that orientation
-            dims_in.append(round(edge, 2))
-        rows.append({
-            "orientations": orientations,
-            "cell_w_px": cell_w,
-            "cell_h_px": band_h,
-            "n": len(cell_w),
-            "row_dim_in_per_cell": dims_in,
-        })
+        # SEGMENT this band into contiguous runs; EACH run is its own qualified row.
+        runs = _segment_by_gaps(vseps, cell_w)
+        for run in runs:
+            orientations, dims_in, run_w = [], [], []
+            for j in run:
+                w = cell_w[j]
+                orient = "portrait" if band_h > w else "landscape"
+                orientations.append(orient)
+                edge = LONG_IN if orient == "landscape" else SHORT_IN
+                dims_in.append(round(edge, 2))
+                run_w.append(w)
+            rows.append({
+                "orientations": orientations,
+                "cell_w_px": run_w,
+                "cell_h_px": band_h,
+                "n": len(run),
+                "row_dim_in_per_cell": dims_in,
+            })
     return rows
 
 

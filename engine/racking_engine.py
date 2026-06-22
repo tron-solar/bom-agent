@@ -29,7 +29,7 @@ SOURCING POLICY:
   deck_screw  : FORMULA (truth)
   ground_lug  : FORMULA (truth)
   wire_clip   : FORMULA (truth)
-  end_cap     : FORMULA (truth)
+  end_cap     : PLANSET (end-clamp qty), checked vs formula (rows*4)
 """
 import math
 
@@ -225,14 +225,19 @@ def edge_along_rail(orientation, module_dims=None):
 # ---------- FORMULAS (always computed; truth for some items, cross-check for others) ----------
 
 def f_attachments(arrays):
-    """(landscape*3 + portrait*2) + rows*2 + interrupted_rows*2, summed per array."""
+    """Attachment cross-check formula, from the canonical BOM tool (BOM Builder C8):
+        (portrait*2) + (landscape*3) + (rows*2)
+    ROWS MODEL (user, Dare): an interrupted run is counted as SEPARATE ROWS, not as a
+    distinct 'interrupted row' quantity. A rail run split by a gap/obstruction/orientation
+    change into k contiguous segments counts as k rows. So there is no interrupted-row term
+    anymore — every segment is its own row. (This replaces the old +interrupted*k terms.)
+    Attachment qty itself is PLANSET-SOURCED; this formula is the cross-check (see check_racking)."""
     tot = 0
     for a in arrays:
         l = sum(r["n"] for r in a["rows"] if r["orient"] == "landscape")
         p = sum(r["n"] for r in a["rows"] if r["orient"] == "portrait")
         nrows = len(a["rows"])
-        irows = sum(1 for r in a["rows"] if r.get("interrupted"))
-        tot += l * 3 + p * 2 + nrows * 2 + irows * 2
+        tot += p * 2 + l * 3 + nrows * 2
     return tot
 
 def f_rails(arrays, module_dims=None):
@@ -265,19 +270,16 @@ def f_rails(arrays, module_dims=None):
     return math.ceil(span / RAIL_LEN_IN) * 2 + 1
 
 def f_splice(arrays, module_dims=None):
-    """CONFIRMED formula: per row (ceil(row_width/172)-1)*2.
-    NOTE: per policy, splice is now PLANSET-ONLY. This stays for reference/telemetry
-    until the user supplies the official splice formula. Module dims read from PV-3."""
-    md = module_dims or ModuleDims.sirius_default()
-    tot = 0
-    for a in arrays:
-        for r in a["rows"]:
-            w = r["n"] * edge_along_rail(r["orient"], md)
-            tot += (math.ceil(w / RAIL_LEN_IN) - 1) * 2
-    return tot
+    """NO SPLICE FORMULA EXISTS (user, Meyer #877571). Splice is PLANSET-TRUTH ONLY.
+    Returns None so the engine never emits a computed splice number — the prior legacy formula
+    produced phantom telemetry (e.g. "10") that looked like a real cross-check. Splice is delivered
+    straight from the planset BOM table; there is nothing to compute or compare against."""
+    return None
 
 def f_combo_clamp(arrays):
-    """mid+end clamps: modules*2 + rows*2 + 2, per array. (Cross-check basis.)"""
+    """Combo clamp (4000145-US K2 Cross (Combo) Clamp DC) cross-check, from BOM tool C11:
+        (total_modules*2) + (rows*2) + 2
+    TRUTH is mid+end clamps summed from the PLANSET BOM table (user); this is the cross-check."""
     tot = 0
     for a in arrays:
         mods = sum(r["n"] for r in a["rows"])
@@ -287,17 +289,233 @@ def f_combo_clamp(arrays):
 def f_deck_screw(attachments):       # TRUTH
     return attachments * 4
 
-def f_ground_lug(arrays):            # TRUTH
-    return sum(len(a["rows"]) + 2 * sum(1 for r in a["rows"] if r.get("interrupted"))
-               for a in arrays)
+def k2_ground_mount(bom_table, has_enphase_micros, module_count):
+    """
+    K2 GROUND MOUNT BOM (Solar rows 73-90), read STRAIGHT from the PV-3.1 K2 BOM table.
+    bom_table: dict of values read off the PV-3.1 "Bill of materials" table, keyed by part number
+        or our normalized name. Recognized keys (qty values):
+          "4001370"/"rail_216"      -> row 73 (CrossRail 80, 216")
+          "4000708"/"rail_172"      -> row 74 (CrossRail 80, 172")
+          "4001196"/"splice"        -> row 75 (rail splice/connector)
+          "4000198"/"top_cap"       -> row 76 (GM Residential Top Cap 3)
+          "4000175"/"pipe_bracket"  -> row 77 (3" Pipe-Bracket Kit)
+          "4001221"/"end_cap"       -> row 78 (GM EndCap CR80)
+          "4000145"/"combo_clamp"   -> row 80 (Cross Clamp Set = mid+end SUMMED)
+          "4000006-H"/"ground_lug"  -> row 82 (K2 Ground Lug)
+          "ground_screw"            -> row 85 (Ground Screw)
+          "ns_pipe_front_60"        -> row 86 ; "ns_pipe_rear_120" -> row 87
+          "ew_pipe"                 -> row 88 (E/W pipe; "Pipe - Length 10 ft")
+          "diag_brace"              -> row 89
+          "pipe_coupling_3"         -> row 84 SPECIAL (see rule 4)
+
+    FOUR STRUCTURAL RULES (user, Munoz):
+      1. NEVER include HEYClip SunRunner Cable Clip SS (4000382) on a GM BOM — dropped entirely.
+      2. ONLY include CR Micro inverter & OPT 13mm Hex (4000629-H, row 81) when the project
+         specifies ENPHASE micro-inverters. Tesla-MCI ground mounts -> excluded.
+      3. NEVER include K2 Cross Cap (4000312) on a GM BOM — dropped entirely.
+      4. Pipe Coupling 3" (Third Party) -> ALWAYS create a new SKU in ROW 84: B84 = C84 =
+         the exact verbiage "Pipe Coupling 3\" (Third Party)", qty pulled from the plans.
+
+    THREE MORE COMPUTED/MAPPING RULES (user):
+      5. END CAP (4001221, row 78) = total RAIL qty * 2 (rows 73 + 74 summed), ALWAYS — computed,
+         NOT read from the table (overrides any table value).
+      6. WIRE CLIP (4000069, row 83) = module_count * 2, ALWAYS — computed, NOT from the table.
+      7. The "Pipe - Length 10 ft (Third Party)" line IS the 120" Rear N/S Pipe 3" (row 87).
+         Map "ew_pipe"/"pipe_10ft" -> row 87 (NOT row 88). qty from plans.
+
+    Returns (rows, cell_overrides, flags):
+      rows: {solar_row: qty}; cell_overrides: {row: (B_text, C_text)} for the row-84 SKU creation.
+    """
+    _MAP = {
+        "4001370": 73, "rail_216": 73,
+        "4000708": 74, "rail_172": 74,
+        "4001196": 75, "splice": 75,
+        "4000198": 76, "top_cap": 76,
+        "4000175": 77, "pipe_bracket": 77,
+        # 4001221 end cap (78) is COMPUTED (rule 5), not table-read
+        "4000145": 80, "combo_clamp": 80,
+        "4000006-H": 82, "ground_lug": 82,
+        # 4000069 wire clip (83) is COMPUTED (rule 6)
+        "ground_screw": 85,
+        "ns_pipe_front_60": 86,
+        # rule 7: the third-party 10ft pipe is the 120" Rear N/S Pipe -> row 87
+        "ns_pipe_rear_120": 87, "ew_pipe": 87, "pipe_10ft": 87,
+        "diag_brace": 89,
+    }
+    # Rules 1 & 3: NEVER on a GM BOM. Also drop any table end-cap/wire-clip — they are computed (5,6).
+    _NEVER = {"4000382", "heyclip", "sunrunner", "4000312", "cross_cap", "k2_cross_cap"}
+    _COMPUTED_SKIP = {"4001221", "end_cap", "4000069", "wire_clip", "wireclip"}
+
+    rows: dict[int, int] = {}
+    overrides: dict[int, tuple] = {}
+    flags: list = []
+    rail_qty = 0
+
+    for key, qty in bom_table.items():
+        k = str(key).lower()
+        if k in _NEVER:
+            continue  # rules 1 & 3
+        if k in _COMPUTED_SKIP:
+            continue  # rules 5 & 6 compute these; ignore any table value
+        # rule 2: micro-inverter lug only with Enphase
+        if key in ("4000629-H", "4000629") or "micro inverter" in k or "mlpe" in k:
+            if has_enphase_micros:
+                rows[81] = rows.get(81, 0) + qty
+            continue
+        # rule 4: pipe coupling 3" -> new SKU in row 84
+        if "pipe_coupling" in k or "pipe coupling" in k:
+            verbiage = 'Pipe Coupling 3" (Third Party)'
+            rows[84] = qty
+            overrides[84] = (verbiage, verbiage)
+            continue
+        # normal mapped lines
+        if key in _MAP:
+            r = _MAP[key]
+            rows[r] = rows.get(r, 0) + qty
+            if r in (73, 74):
+                rail_qty += qty
+        else:
+            flags.append({"level": "WARN", "item": "gm_line_unmapped",
+                          "detail": f"K2 GM BOM line {key!r} (qty {qty}) has no template row"})
+
+    # rule 5: end cap (78) = rail qty * 2, ALWAYS
+    rows[78] = rail_qty * 2
+    # rule 6: wire clip (83) = module_count * 2, ALWAYS
+    rows[83] = module_count * 2
+
+    return rows, overrides, flags
+
+
+def f_k2_shingle_screws(attachments, deck_mounted, rafter_mounted):
+    """
+    K2 Multimount shingle attach screws — rows 34 (lag) vs 35 (deck screw) are MUTUALLY EXCLUSIVE
+    PER ATTACHMENT, selected by HOW each attachment is fastened (read from PV-3/PV-4):
+      - rafter/truss-mounted attach -> 1 lag screw each (4000170, row 34)
+      - deck-mounted attach         -> 4 deck screws each (4000310, row 35)
+    deck_mounted + rafter_mounted MUST equal attachments. All-deck (Roland) -> only row 35 = 4*N,
+    row 34 = 0. Returns {row: qty}.
+    """
+    if deck_mounted + rafter_mounted != attachments:
+        raise ValueError(f"deck({deck_mounted})+rafter({rafter_mounted}) != attachments({attachments})")
+    rows: dict[int, int] = {}
+    if rafter_mounted:
+        rows[34] = rafter_mounted
+    if deck_mounted:
+        rows[35] = 4 * deck_mounted
+    return rows
+
+
+def f_jboxes(roof_planes, roof_type):
+    """
+    J-box count + which SKU row.
+    roof_planes: list of dicts, one per PHYSICAL roof plane:
+        {"label": "Roof #1", "strings": <int strings landing on THIS plane>}
+    roof_type: "shingle" -> JB-1.2 (row 25); everything else roof + ground -> JB-3 (row 26).
+
+    RULE (user, Roland): the count is per ROOF PLANE.
+      - FLOOR = number of roof planes (one J-box minimum per plane).
+      - A single J-box holds <=4 strings, so a plane with >4 strings needs ceil(strings/4).
+      => per-plane jbox = max(1, ceil(strings_on_plane / 4)); total = sum over planes.
+    Returns (row, total_qty).
+    """
+    row = 25 if roof_type == "shingle" else 26
+    total = 0
+    for p in roof_planes:
+        s = p.get("strings", 0)
+        total += max(1, math.ceil(s / 4)) if s else 1
+    return row, total
+
+
+def f_ground_lug(arrays):            # TRUTH (formula), from BOM tool C15 under the new rows model
+    """Ground lug = rows + 1.  BOM tool C15 = B6 + (B7*2); with the new model B7=0 (interrupted
+    runs are separate rows), so it reduces to rows. User: ADD ONE ground lug by default to every
+    project -> rows + 1. (The +1 default also offsets the -1 from folding interrupted into rows.)"""
+    rows = sum(len(a["rows"]) for a in arrays)
+    return rows + 1
 
 def f_wire_clip(arrays):             # TRUTH
     return 2 * sum(r["n"] for a in arrays for r in a["rows"])
 
-def f_end_cap(arrays):               # TRUTH
-    return sum(len(a["rows"]) * 4 +
-               4 * sum(1 for r in a["rows"] if r.get("interrupted"))
-               for a in arrays)
+def f_s_clip(total_modules):         # TRUTH (user, Dare): modules * 6
+    """S-clips (SnapNRack Smart Clip II, Solar row 30) = total_modules * 6.
+    Written as a STATIC NUMBER in output (NOT the template '=IF(...)*6' formula), because Excel
+    Protected View doesn't calc formulas and openpyxl writes no cached value -> would show blank."""
+    return total_modules * 6
+
+def f_rail_clamp(planset_attachments):  # TRUTH (user, Dare): = attachment qty
+    """Rail clamp (4000770 K2 Rail Clamp, Solar row 46) = attachment quantity (1 per attachment).
+    BOM tool C13 = C8. Written as a STATIC NUMBER in output (NOT '=A37')."""
+    return planset_attachments
+
+
+def f_disconnect_hubs(disconnect_counts):
+    """B-hubs sized to the AC DISCONNECTS (Electrical rows 13/14/15). NOT contingent on DC
+    disconnects (rows 17/18). Two hubs per disconnect (line + load conduit entry). User, Dare.
+      disconnect_counts: dict of AC-disconnect amperage -> count, e.g. {60: 4, 100: 1, 200: 0}.
+    Returns {electrical_row: qty}:
+      row 13 (B075, 3/4\" hub, 30/60A) = 2 * (count_60A + count_30A)
+      row 14 (B125, 1-1/4\" hub, 100A) = 2 * count_100A
+      row 15 (B200, 2\" hub, 200A)     = 2 * count_200A
+    """
+    c = lambda a: disconnect_counts.get(a, 0)
+    rows = {}
+    r13 = 2 * (c(60) + c(30))
+    r14 = 2 * c(100)
+    r15 = 2 * c(200)
+    if r13: rows[13] = r13
+    if r14: rows[14] = r14
+    if r15: rows[15] = r15
+    return rows
+
+
+def f_end_cap(arrays):               # cross-check; TRUTH is planset end-clamp qty
+    """End cap (4000176 K2 End Cap 44-X Roof) cross-check, BOM tool C12 = (rows*4)+(interrupted*4).
+    New model: interrupted=0 (folded into rows), so = rows*4. TRUTH is the planset end-clamp qty;
+    this formula is the cross-check (see racking_crosscheck)."""
+    return sum(len(a["rows"]) * 4 for a in arrays)
+
+def racking_crosscheck(item, plan_value, formula_value, attachment_type=None):
+    """Asymmetric tolerance cross-check (user rule, Dare).
+    Pass band: plan-3 <= formula <= plan+2. Outside -> HARD flag.
+      - flag if formula is MORE THAN 2 ABOVE plan (formula - plan > 2)
+      - flag if formula is MORE THAN 3 BELOW plan (plan - formula > 3)
+    Returns a flag dict or None. plan_value is the delivered (planset) quantity; formula_value is
+    the computed cross-check. Used for attach, combo clamp, end cap (all planset-sourced).
+
+    KNOWN-LIMITATION DOWNGRADE — S-5! ProteaBracket 45in spacing (user, Nelson REVA):
+      On a large metal ProteaBracket roof the installer drops attachment spacing from 48in to 45in,
+      adding attach points the cross-check formula (which is NOT built on 48in spacing and has no
+      spacing term) cannot predict. The 1.066 factor approximates this but never lands cleanly. The
+      result is a benign attach UNDERSHOOT by the formula (and a knock-on combo OVERSHOOT, since
+      combo's row term is unaffected while its module term is fixed). Neither is a row-count error.
+      So for attachment_type == 'S5_PROTEABRACKET' the attach (and dependent combo) deltas are
+      emitted as a NOTE on the confidence report, NOT a HARD hold. Plan attachment qty is still
+      delivered unchanged. This downgrade is SCOPED to ProteaBracket and to the attach/combo items
+      so it cannot mask a genuine miscount on any other attachment type or item (end_cap still HOLDs).
+    """
+    if plan_value is None or formula_value is None:
+        return None
+    is_high = formula_value - plan_value > 2
+    is_low  = plan_value - formula_value > 3
+    if not (is_high or is_low):
+        return None
+
+    proteabracket_spacing_case = (
+        attachment_type == "S5_PROTEABRACKET" and item in ("attachments", "combo_clamp")
+    )
+    level = "NOTE" if proteabracket_spacing_case else "HARD"
+    direction = "high" if is_high else "low"
+    sign = formula_value - plan_value
+    base_msg = (f"{item}: planset={plan_value}, formula={formula_value} "
+                f"({sign:+d}). ")
+    if proteabracket_spacing_case:
+        msg = (base_msg + "S-5! ProteaBracket 45in attachment spacing (vs the formula's 48in-free "
+               "model) accounts for this delta; the 1.066 factor approximates it but is not clean. "
+               "Delivering plan attachment qty as truth — NO hold. (Confidence-report note only.)")
+    else:
+        bound = "+2" if is_high else "-3"
+        msg = base_msg + f"(exceeds {bound}). Verify row count / plan BOM."
+    return {"level": level, "item": f"{item}_crosscheck_{direction}", "msg": msg}
 
 
 # ---------- MANDATORY ORIENTATION GATE (runs on EVERY array, EVERY build) ----------
@@ -502,7 +720,8 @@ def resolve_racking(arrays, planset, enforce_orientation_gate=True, attachment_t
         "deck_screw":  f_deck_screw(planset["attachments"]),  # 4 per delivered attachment
         "ground_lug":  f_ground_lug(arrays),
         "wire_clip":   f_wire_clip(arrays),
-        "end_cap":     f_end_cap(arrays),
+        # end cap = PLAN END-CLAMP qty (TRUTH); rows*4 is the CROSS-CHECK (f_end_cap)
+        "end_cap":     planset["end_clamps"],
         # rail clamps = attachments (delivered)
         "rail_clamp":  planset["attachments"],
     }
@@ -520,18 +739,26 @@ def resolve_racking(arrays, planset, enforce_orientation_gate=True, attachment_t
     # gave delta +5; correct 4L+5P gave delta 0. The +5 WAS the 5 portrait modules misread landscape.)
     attach_chk = chk("attachments", planset["attachments"], comp_attach)
     if attach_chk["match"]:
-        attach_chk["orientation_signal"] = "EXACT -> orientation mix corroborated"
+        attach_chk["orientation_signal"] = "EXACT -> orientation mix + row segmentation corroborated"
     else:
         dlt = attach_chk["delta"]
         total_mods = sum(r["n"] for a in arrays for r in a["rows"])
-        if 0 < abs(dlt) <= total_mods:
+        in_band = -3 <= dlt <= 2   # same asymmetric tolerance as racking_crosscheck
+        if in_band:
             attach_chk["orientation_signal"] = (
-                f"delta {dlt:+d}: a landscape<->portrait misread of {abs(dlt)} module(s) would "
-                f"explain this exactly (landscape costs +1 attach vs portrait). RE-CHECK per-module "
-                f"orientation from the rotated raster before trusting the read.")
+                f"delta {dlt:+d}: within tolerance (-3..+2) -> orientation mix + row segmentation "
+                f"corroborated. attach is planset-truth regardless.")
+        elif 0 < abs(dlt) <= total_mods:
+            attach_chk["orientation_signal"] = (
+                f"delta {dlt:+d}: OUT of tolerance and equals a plausible read error. A "
+                f"landscape<->portrait misread of {abs(dlt)} module(s) (landscape costs +1 attach vs "
+                f"portrait) OR a wrong row-SEGMENTATION (each row adds +2 attach) would explain it. "
+                f"RE-CHECK per-module orientation AND contiguous-run segmentation from the rotated "
+                f"raster before trusting the read.")
         else:
             attach_chk["orientation_signal"] = (
-                f"delta {dlt:+d}: not cleanly explained by an L/P swap; likely shared-geometry telemetry.")
+                f"delta {dlt:+d}: out of tolerance, not cleanly explained by an L/P swap or row "
+                f"miscount; verify the geometry read and the planset BOM value.")
 
     # 1.066 PLANSET-ATTACHMENT CHECK — SCOPED (user, Woroszylo correction):
     # The 1.066 factor models the EXTRA attach points from S-5! ProteaBracket's TIGHTER 45" spacing
@@ -564,17 +791,72 @@ def resolve_racking(arrays, planset, enforce_orientation_gate=True, attachment_t
 
     rails_chk = chk("rails", planset["rails"], comp_rails)
     rails_chk["module_dims"] = {"long_in": md.long_in, "short_in": md.short_in, "source": md.source}
+
+    # SEGMENTATION VALIDATOR — END CLAMPS / 4 = ROW COUNT (user, Meyer #877571, Option B).
+    # end_cap = rows*4 EXACTLY (each row has 4 end clamps: 2 ends x 2 rails). The planset prints the
+    # end-clamp qty, so plan_end_clamps/4 is the AUTHORITATIVE row count. The engine's segmented row
+    # count (from contiguous-run detection) MUST equal it. attach is only ±2/row (weak at adjacent
+    # counts); end clamps are unambiguous (a 2-vs-4 row misread is 8 vs 16 — impossible to miss).
+    # Mismatch -> HARD hold: the contiguous-run segmentation was misread, re-run detection.
+    detected_rows = sum(len(a["rows"]) for a in arrays)
+    plan_end = planset["end_clamps"]
+    seg_flag = None
+    if plan_end % 4 == 0:
+        plan_rows = plan_end // 4
+        if detected_rows != plan_rows:
+            seg_flag = {"level": "HARD", "item": "row_segmentation_mismatch",
+                        "msg": (f"Segmented row count = {detected_rows}, but planset end clamps = "
+                                f"{plan_end} imply {plan_rows} rows (end_clamps/4). The contiguous-run "
+                                f"segmentation was misread — re-run module detection from the rotated "
+                                f"raster. (Each row = 4 end clamps; this is the exact row anchor.)")}
+    else:
+        seg_flag = {"level": "NOTE", "item": "end_clamps_not_div4",
+                    "msg": (f"Planset end clamps = {plan_end} is not divisible by 4, so the exact "
+                            f"row-count validator can't run. Verify the end-clamp value / row read.")}
+    rails_chk["segmentation_check"] = (seg_flag["msg"] if seg_flag
+                                       else f"OK: {detected_rows} rows == end_clamps/4")
+
+    # TOLERANCE FLAGS (attachment_type-aware). attach + combo deltas on a ProteaBracket roof are
+    # downgraded to NOTE inside racking_crosscheck (45in-spacing known limitation); end_cap stays HARD.
+    comp_endcap = f_end_cap(arrays)
+    flags = []
+    if seg_flag:
+        flags.append(seg_flag)
+    for item, plan_v, comp_v in (
+        ("attachments", planset["attachments"], comp_attach),
+        ("combo_clamp", planset_combo,          comp_combo),
+        ("end_cap",     planset["end_clamps"],  comp_endcap),
+    ):
+        f = racking_crosscheck(item, plan_v, comp_v, attachment_type=attachment_type)
+        if f:
+            flags.append(f)
+
+    # RAILS: planset-truth ALWAYS delivered. The formula is still computed and reported, but a
+    # mismatch is only a NOTE on the confidence report — never a HARD hold (user, Meyer #877571).
+    # The per-row rounding runs high on heavily-segmented roofs (each short run forced to a 2-rail
+    # minimum), so a small overage is expected and benign; it's a discrepancy to surface, not a stop.
+    if comp_rails is not None and comp_rails != planset["rails"]:
+        flags.append({"level": "NOTE", "item": "rails_formula_discrepancy",
+                      "msg": f"rails: planset={planset['rails']} (delivered, truth), "
+                             f"formula={comp_rails} ({comp_rails - planset['rails']:+d}). Per-row rail "
+                             f"rounding runs high on segmented layouts; reported as a discrepancy only."})
+
     crosscheck = {
         "attachments": attach_chk,
         "rails":       rails_chk,
         "combo_clamp": chk("combo_clamp", planset_combo, comp_combo),
         "splice":      {"delivered_from": "planset", "planset": planset["splice"],
-                        "computed_legacy": comp_splice, "note": "formula PLANSET-ONLY per policy; official formula TBD"},
+                        "computed": None,
+                        "note": "NO splice formula exists (user). Splice is planset-truth only; "
+                                "nothing is computed or compared."},
         "deck_screw":  {"delivered_from": "formula"},
         "ground_lug":  {"delivered_from": "formula"},
         "wire_clip":   {"delivered_from": "formula"},
-        "end_cap":     {"delivered_from": "formula"},
+        "end_cap":     {"delivered_from": "planset_end_clamp",
+                        "planset": planset["end_clamps"], "computed": comp_endcap,
+                        "delta": comp_endcap - planset["end_clamps"]},
         "orientation_gate": {"enforced": enforce_orientation_gate, "audit": gate_audit},
+        "tolerance_flags": flags,
     }
     return delivered, crosscheck
 
@@ -702,48 +984,112 @@ def microinverter_electrical_block(num_micros, num_branch_circuits,
 
 
 # ====================================================================
-# TESLA ENERGY GATEWAY 3 — BREAKER LOGIC (CSR rule CORRECTED, user/Woroszylo)
+# TESLA ENERGY GATEWAY 3 — BREAKER LOGIC
+# CORRECTED RULE (user, Dare #868257): BR-vs-CSR is decided by BUS-KIT MEMBERSHIP
+# (spatial position in the one-line), NOT by rating. Rating+poles decides the ROW.
 # ====================================================================
 
-# Electrical BOM breaker rows
-_BR_2P_BY_RATING = {15:101, 20:102, 30:103, 40:104, 50:105, 60:106,
-                    70:107, 80:108, 100:109, 125:110}
-_CSR_BY_RATING   = {100:112, 125:113, 200:114}
+# BR (Eaton) breakers, keyed by (amperage, poles) -> Electrical BOM row.
+# These are the GATEWAY INTERNAL BUS-KIT breakers (left-side enclosure on PV-5).
+_BR_ROW_BY_AMP_POLE = {
+    (15, 1): 98,  (20, 1): 99,  (30, 1): 100,
+    (15, 2): 101, (20, 2): 102, (30, 2): 103, (40, 2): 104, (50, 2): 105,
+    (60, 2): 106, (70, 2): 107, (80, 2): 108, (100, 2): 109, (125, 2): 110,
+}
+# CSR (Eaton) MAIN breakers, keyed by amperage (always 2-pole) -> row.
+# These sit OUTSIDE the bus-kit, on the conductors entering the gateway from the RIGHT.
+_CSR_ROW_BY_AMP = {100: 112, 125: 113, 200: 114}
 
 
-def tesla_gateway_breakers(buskit_60a_2p_count, battery_pw3_count,
-                           gateway_breakers_outside_buskit):
-    """Breakers for a Tesla Energy Gateway 3 project. Returns {electrical_row: qty}.
+def tesla_gateway_breakers(buskit_breakers, csr_breakers, battery_pw3_count,
+                           master_note_csr=None):
+    """Breakers for a Tesla Energy Gateway 3. Returns ({electrical_row: qty}, flags).
 
-    RULE (CORRECTED — user, Woroszylo): There is NEVER an existing/excluded breaker drawn
-    inside the Tesla Energy Gateway. EVERY rated breaker drawn in the Gateway that sits
-    OUTSIDE the internal bus-kit is a NEW CSR main breaker and MUST be ordered, mapped by
-    rating: 100A->CSR2100(112), 125A->CSR2125(113), 200A->CSR2200(114). This fires EVERY
-    time such a breaker is present (no "is it the gateway main / is it existing" judgment —
-    that judgment was the Woroszylo miss, where a 200A/2P CSR was wrongly excluded as an
-    "internal main"). It also matches Eroh ("200A CSR in TEG" -> CSR2200) as the universal rule.
+    CORRECTED RULE (user, Dare): the discriminator is WHERE the breaker sits, not its rating.
+      - Breakers INSIDE the "GATEWAY INTERNAL BUS-KIT" enclosure  -> BR breakers (rows 98-110)
+      - Breakers OUTSIDE it, on the lines entering the gateway from the RIGHT -> CSR mains (112-114)
+    Rating + poles, read directly off the plan's breaker label ("60A/2P", "100A/2P"), selects the row.
 
-      buskit_60a_2p_count            : number of 60A/2P breakers drawn INSIDE the bus-kit
-                                       (one per PW3). Drives BR260.
-      battery_pw3_count              : count of PW3 (1707000) units (expansion EXCLUDED).
-      gateway_breakers_outside_buskit: list of ratings (amps, 2-pole) drawn in the Gateway
-                                       OUTSIDE the bus-kit, e.g. [200] or [100, 200].
-                                       EACH becomes a CSR. (The small unrated microgrid-
-                                       interconnect toggle has no rating callout -> not passed in.)
+    This reconciles the whole history: the Woroszylo 200A was a CSR because it was outside the bus-kit;
+    the Dare 100A is a BR because it is inside it. Rating never decided it — bus-kit membership did.
 
-    BR260 floor: max(bus-kit 60A/2P count, PW3 battery count).
+      buskit_breakers : list of (amperage, poles) for breakers drawn INSIDE the bus-kit box.
+                        Dare: [(60,2),(60,2),(100,2)] -> 2x BR260 + 1x BR2100.
+      csr_breakers    : list of amperages for rated CSR MAIN breakers landing into the gateway
+                        (independent of the per-PW3 60A/2P bus-kit breakers — user, Nelson).
+                        Dare: [] -> no CSR. Woroszylo: [200]. Nelson: [200] -> CSR2200 row 114.
+      battery_pw3_count : count of PW3 (1707000) units (expansion EXCLUDED). Used for the per-PW3
+                        reconciliation gate. The CSR main is INDEPENDENT of this count (user, Nelson):
+                        a 200A CSR + 2x 60A/2P (one per PW3) all coexist in the TEG.
+      master_note_csr : CSR amperage(s) the Coperniq Master Note mentions for a breaker in the TEG
+                        (int, list[int], or None). Used ONLY as a CROSS-CHECK on the plan-classified
+                        CSR set — it NEVER adds a breaker itself (plans are authoritative). It exists
+                        to catch a DROPPED CSR main: the note almost always correctly states whether a
+                        CSR is in the TEG and its size (user). See the gate below.
+
+    Returns (rows, flags). `flags` carries HARD confidence flags when something doesn't reconcile,
+    so an uncertain extraction holds + posts to Teams rather than ordering the wrong breaker.
     """
-    out = {}
-    # BR260 backup breaker(s) for the PW3(s) on the bus-kit
-    br260 = max(buskit_60a_2p_count, battery_pw3_count)
-    if br260 > 0:
-        out[106] = out.get(106, 0) + br260
-    # CSR main breaker(s) — EVERY rated breaker outside the bus-kit is a NEW CSR
-    for rating in gateway_breakers_outside_buskit:
-        row = _CSR_BY_RATING.get(rating)
+    rows: dict = {}
+    flags: list = []
+
+    # BR breakers (inside bus-kit) -> rows by (amp, poles)
+    br260_count = 0
+    for amp, poles in buskit_breakers:
+        row = _BR_ROW_BY_AMP_POLE.get((amp, poles))
         if row is None:
-            # rating without a CSR row (rare) — flag via a sentinel key the caller can surface
-            out.setdefault("_csr_unmapped", []).append(rating)
+            flags.append({"level": "HARD", "item": "buskit_breaker_unmapped",
+                          "msg": f"Bus-kit breaker {amp}A/{poles}P has no BR row (rows 98-110). "
+                                 f"Verify the breaker label on PV-5."})
             continue
-        out[row] = out.get(row, 0) + 1
-    return out
+        rows[row] = rows.get(row, 0) + 1
+        if (amp, poles) == (60, 2):
+            br260_count += 1
+
+    # CSR breakers (CSR mains into the gateway) -> rows by amperage
+    plan_csr_amps = list(csr_breakers or [])
+    for amp in plan_csr_amps:
+        row = _CSR_ROW_BY_AMP.get(amp)
+        if row is None:
+            flags.append({"level": "HARD", "item": "csr_breaker_unmapped",
+                          "msg": f"CSR breaker {amp}A has no CSR row (112-114). Verify PV-5."})
+            continue
+        rows[row] = rows.get(row, 0) + 1
+
+    # RECONCILIATION GATE 1: each PW3 backs onto a 60A/2P bus-kit breaker. If the count of
+    # 60A/2P bus-kit breakers != PW3 count, the spatial read of the bus-kit is suspect -> HARD flag.
+    # (CSR mains are INDEPENDENT and do NOT count toward this — user, Nelson.)
+    if battery_pw3_count and br260_count != battery_pw3_count:
+        flags.append({"level": "HARD", "item": "buskit_br260_vs_pw3_mismatch",
+                      "msg": f"Found {br260_count} x 60A/2P bus-kit breaker(s) but {battery_pw3_count} "
+                             f"PW3 unit(s). These should match (one 60A/2P per PW3). The bus-kit "
+                             f"breaker read may be wrong — verify PV-5 before ordering."})
+
+    # RECONCILIATION GATE 2 — CSR vs MASTER NOTE (user, Nelson REVA #860742):
+    # The Master Note almost always states whether a CSR breaker is in the TEG and its size. The
+    # plan is authoritative for the delivered breaker, but the note is the CROSS-CHECK that catches a
+    # DROPPED CSR main — exactly the miss that happened here (a 200A CSR landing into the gateway was
+    # misclassified as the excluded existing-MSP main, so csr_breakers came in empty and nothing
+    # flagged it). If the note mentions a CSR and the plan-classified CSR set does not contain it
+    # (or the amperage differs), HOLD: the gateway read is suspect. The note NEVER adds the breaker
+    # (plans win); it only forces a human verify so a service main can't be silently lost.
+    note_amps = ([master_note_csr] if isinstance(master_note_csr, int)
+                 else list(master_note_csr or []))
+    note_amps = [a for a in note_amps if a]
+    if note_amps:
+        for amp in note_amps:
+            if amp not in plan_csr_amps:
+                flags.append({"level": "HARD", "item": "csr_plan_vs_note_mismatch",
+                              "msg": f"Master Note states a {amp}A CSR breaker in the TEG, but the "
+                                     f"plan-classified CSR set is {plan_csr_amps or 'empty'}. A CSR "
+                                     f"service main may have been dropped or misread as the existing "
+                                     f"MSP main — verify PV-5 (the 200A/2P line INTO the gateway is a "
+                                     f"CSR main, NOT the excluded existing house main). Plans remain "
+                                     f"authoritative; this is a hold, not an override."})
+
+    if not buskit_breakers and not csr_breakers:
+        flags.append({"level": "HARD", "item": "no_gateway_breakers_found",
+                      "msg": "A Tesla Gateway is present but no breakers were classified. The "
+                             "bus-kit enclosure may not have been read — verify PV-5."})
+
+    return rows, flags
