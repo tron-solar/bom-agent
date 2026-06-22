@@ -84,6 +84,11 @@ class PlansetData:
     confidence_scores: dict = field(default_factory=dict)
     extraction_warnings: list = field(default_factory=list)
 
+    # --- Structured PV-5 electrical reads (consumed by the engine blocks in orchestrator) ---
+    # ac_disconnects/dc_disconnects/buskit_breakers/csr_breakers/pw3_skus/one_line_text + meter/MSP
+    # new-flag and equipment SKU + gateway_count/backup_switch/inverter_sku/remote_meter_count.
+    electrical: dict = field(default_factory=dict)
+
 
 class PlansetExtractor:
     """
@@ -369,29 +374,72 @@ Rules:
         return self._parse_json(raw)
 
     async def _extract_three_line(self, image_b64: str) -> dict:
-        """Extract electrical data from PV-5 three-line diagram."""
-        prompt = """You are extracting data from a Tron Solar three-line electrical diagram (PV-5).
-Extract the following fields and return ONLY valid JSON, no other text.
+        """Extract electrical data from the PV-5 three-line diagram (drives the engine's electrical blocks)."""
+        prompt = """You are extracting the electrical schedule from a Tron Solar three-line diagram (PV-5).
+Return ONLY valid JSON, no other text:
 
 {
   "meter_number": "string or null",
   "service_type": "underground or overhead or null",
-  "nominal_voltage": "number or null",
-  "main_panel_amperage": "integer or null",
-  "interconnection_method": "load side or line side or null"
+  "nominal_voltage": number or null,
+  "main_panel_amperage": integer or null,
+  "interconnection_method": "load side or line side or null",
+
+  "ac_disconnects": [ {"amp": integer, "fused": boolean, "fuse_amp": integer or null} ],
+  "dc_disconnects": [ {"poles": integer} ],
+
+  "new_meter_drawn": boolean,
+  "meter_pn": "string or null",
+  "new_msp_drawn": boolean,
+  "msp_pn": "string or null",
+
+  "gateway_count": integer,
+  "backup_switch": boolean,
+  "pw3_skus": ["string"],
+  "inverter_sku": "string or null",
+  "remote_meter_count": integer,
+
+  "buskit_breakers": [ {"amp": integer, "poles": integer} ],
+  "csr_breakers": [ integer ],
+
+  "one_line_text": "string"
 }
 
-Rules:
-- meter_number is the electric meter serial/ID number shown near the meter symbol
-- service_type: look for labels like "underground service entrance" or "overhead service"
-- nominal_voltage: the utility service voltage (e.g. 120/240, 240) — return as number (use 240 for 120/240V)
-- main_panel_amperage: the main breaker/panel amperage (e.g. 200, 100, 400)
-- interconnection_method: "load side" if the PV connects on the load side of the main breaker;
-  "line side" if it connects between the meter and main breaker
-- Return null for any field not clearly visible"""
+Rules — read the LABELS, not just the symbols:
+- meter_number: the meter serial/ID near the meter symbol (NOT the meter equipment SKU).
+- service_type / nominal_voltage (use 240 for 120/240V) / main_panel_amperage / interconnection_method
+  as before; null if not clearly visible.
+- ac_disconnects: ONE entry per AC disconnect drawn. "amp" = the disconnect rating; "fused" = true only
+  if the disconnect is labeled FUSED (read the label, e.g. "FUSED"/"NON-FUSED" or "PV/ESS DISCONNECT");
+  "fuse_amp" = the FUSE rating drawn inside the block (may differ from the disconnect amp), else null.
+- dc_disconnects: ONE entry per DC disconnect; "poles" = pole count (2 = single string, 4 = two strings).
+- new_meter_drawn: true ONLY if the plan draws/specifies a NEW meter/socket/base (e.g. PV-1 scope or
+  PV-5 note "UPGRADE METER BASE TO NEW ..."). An existing/retained meter -> false.
+- meter_pn: the EXACT NEW meter equipment part number (e.g. "U9551-RXL-QG-5T9-AMS"), else null.
+- new_msp_drawn: true ONLY if the plan specifies a NEW main service panel; an existing MSP that remains -> false.
+- msp_pn: the EXACT NEW MSP part number, else null.
+- gateway_count: number of Tesla Energy Gateway units drawn (usually 0 or 1).
+- backup_switch: true if a Tesla Backup Switch is drawn (Gateway and Backup Switch rarely coexist).
+- pw3_skus: one entry per Powerwall 3 unit drawn, using its 1707000-... SKU (EXCLUDE PW3 Expansion units).
+- inverter_sku: a standalone Tesla inverter SKU if drawn, else null.
+- remote_meter_count: count of "TESLA REMOTE ENERGY METER" blocks, else 0.
+- buskit_breakers: breakers drawn INSIDE the "GATEWAY INTERNAL BUS-KIT" enclosure (left side of the
+  gateway). One entry per breaker: {"amp", "poles"} read from its label (e.g. "60A/2P","100A/2P").
+- csr_breakers: amperages of rated MAIN breakers landing into the gateway from the RIGHT, OUTSIDE the
+  bus-kit (e.g. [200]). Empty if none. Do NOT include service-panel mains.
+- one_line_text: a verbatim transcription of the one-line's text labels/notes (so supply-side tap SKUs
+  like "K4977", "NSI IT-3/0", "IT-250" can be matched). Keep it under ~1500 characters.
+- Use [] / 0 / false for absent items; null only for the string/number fields that say "or null"."""
 
         raw = await self._call_claude([image_b64], prompt)
-        return self._parse_json(raw)
+        try:
+            return self._parse_json(raw)
+        except (ValueError, json.JSONDecodeError) as e:
+            # Don't fail the whole run on a PV-5 parse miss — log the raw response and return the
+            # minimal shape so the orchestrator flags missing electrical detail instead of crashing.
+            log.error("PV-5 three-line parse failed: %s", e)
+            log.error("PV-5 raw response (first 1000 chars): %r", (raw or "")[:1000])
+            return {}
 
     async def _extract_roof_plan(self, image_b64: str, module_wattage: float) -> dict:
         """Extract array layout from PV-3 roof plan."""
@@ -500,4 +548,6 @@ Rules:
             # Metadata
             confidence_scores=confidence,
             extraction_warnings=warnings,
+            # Structured PV-5 electrical reads (whole dict; orchestrator reads the keys it needs)
+            electrical=dict(electrical or {}),
         )

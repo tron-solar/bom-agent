@@ -24,6 +24,7 @@ import shutil
 import tempfile
 
 from . import electrical_engine as ee
+from . import racking_engine as re_eng
 from . import bom_writer
 from .extractor import PlansetExtractor
 
@@ -80,26 +81,62 @@ def _build_blocks(planset, project: dict):
     bom_writer.merge_block(elec_rows, r)
     flags += f
 
-    # --- Meter line + special-order P/N path (Electrical rows 81-96) ---
-    # PlansetData carries `meter_number` (a utility METER SERIAL, not an equipment SKU) and no
-    # new-vs-existing signal. The engine rule orders a meter line ONLY for a NEW meter and matches by
-    # exact equipment P/N. Feeding a serial as a P/N would falsely stamp the special-order line, so we
-    # pass new_meter_drawn=False and FLAG that the extractor must surface (a) new-meter-drawn and
-    # (b) the meter equipment SKU. The special-order plumbing below is exercised by the module self-test.
-    r, f, sp = ee.meter_socket(new_meter_drawn=False, meter_pn=None)
-    bom_writer.merge_block(elec_rows, r)
-    bom_writer.merge_special(elec_special, sp)
-    flags += f
+    # ===== PV-5 ELECTRICAL BLOCKS (driven by extractor.PlansetData.electrical) =====
+    elec = getattr(planset, "electrical", None) or {}
+    if not elec:
+        flags.append({"level": "HARD", "item": "pv5_electrical_missing",
+                      "msg": "PV-5 electrical detail was not extracted (empty). AC/DC disconnects, "
+                             "breakers, meter, and MSP could not be auto-populated — build the "
+                             "Electrical sheet manually and verify against PV-5."})
 
-    # --- MSP line + special-order P/N path (Electrical rows 73-79) ---
-    # PlansetData has main_panel_amperage but no MSP equipment SKU and no new-MSP flag -> cannot drive
-    # the line without guessing. Pass new_msp_drawn=False and flag for human/extractor enrichment.
-    r, f, sp = ee.main_service_panel(new_msp_drawn=False, msp_pn=None)
-    bom_writer.merge_block(elec_rows, r)
-    bom_writer.merge_special(elec_special, sp)
-    flags += f
+    # AC disconnects (rows 5-12) + hubs (13-15) + fuses (130-144)
+    if elec.get("ac_disconnects"):
+        r, f = ee.ac_disconnects(elec["ac_disconnects"])
+        bom_writer.merge_block(elec_rows, r); flags += f
 
-    # --- Blocks the v2 extractor's PlansetData cannot yet feed: flag, do NOT guess ---
+    # DC disconnects (rows 17-18) by pole count
+    if elec.get("dc_disconnects"):
+        r, f = ee.dc_disconnects(elec["dc_disconnects"])
+        bom_writer.merge_block(elec_rows, r); flags += f
+
+    # Supply-side taps (rows 26-28) — substring match on the raw one-line text
+    if elec.get("one_line_text"):
+        r, f = ee.supply_side_taps(elec["one_line_text"])
+        bom_writer.merge_block(elec_rows, r); flags += f
+
+    # Tesla PW3 / Gateway / Backup switch / inverter / remote meter (rows 51-57)
+    pw3_skus = elec.get("pw3_skus") or []
+    gateway_count = int(elec.get("gateway_count") or 0)
+    backup_switch = bool(elec.get("backup_switch"))
+    if pw3_skus or gateway_count or backup_switch or elec.get("inverter_sku") or elec.get("remote_meter_count"):
+        r, f = ee.tesla_core(pw3_skus=pw3_skus, gateway_count=gateway_count,
+                             backup_switch=backup_switch, inverter_sku=elec.get("inverter_sku"),
+                             remote_meter_count=int(elec.get("remote_meter_count") or 0))
+        bom_writer.merge_block(elec_rows, r); flags += f
+
+    # Ground bar (row 22) — one per Tesla Gateway
+    if gateway_count:
+        r, f = ee.ground_bar(gateway_count)
+        bom_writer.merge_block(elec_rows, r); flags += f
+
+        # Gateway breakers: bus-kit BR (98-110) / CSR mains (112-114). Only on gateway projects.
+        buskit = [(int(b["amp"]), int(b["poles"]))
+                  for b in (elec.get("buskit_breakers") or []) if b.get("amp") and b.get("poles")]
+        csr = [int(a) for a in (elec.get("csr_breakers") or []) if a]
+        r, f = re_eng.tesla_gateway_breakers(buskit, csr,
+                                             battery_pw3_count=(len(pw3_skus) or battery_count))
+        bom_writer.merge_block(elec_rows, r); flags += f
+
+    # Meter line + special-order P/N (rows 81-96). Ordered ONLY if a NEW meter is drawn; an unmapped
+    # P/N routes to row 96 with the SKU stamped into BOTH col B and C (bom_writer special-order map).
+    r, f, sp = ee.meter_socket(bool(elec.get("new_meter_drawn")), elec.get("meter_pn"))
+    bom_writer.merge_block(elec_rows, r); bom_writer.merge_special(elec_special, sp); flags += f
+
+    # MSP line + special-order P/N (rows 73-79). Same gating: new MSP only; unmapped -> row 79 stamped.
+    r, f, sp = ee.main_service_panel(bool(elec.get("new_msp_drawn")), elec.get("msp_pn"))
+    bom_writer.merge_block(elec_rows, r); bom_writer.merge_special(elec_special, sp); flags += f
+
+    # --- Blocks still NOT auto-fed by the v2 extractor: flag, do NOT guess ---
     flags += _missing_input_flags(planset)
 
     return solar_rows, elec_rows, solar_special, elec_special, flags
@@ -109,17 +146,15 @@ def _missing_input_flags(planset) -> list[dict]:
     """Explicit NOTE flags for every block whose structured inputs the v2 extractor does not surface,
     so a reviewer sees exactly what was NOT auto-populated (no silent gaps). Each names the field the
     extractor must add to make that block headless."""
+    # PV-5 electrical (disconnects, breakers, meter, MSP, taps, gateway) is now wired in _build_blocks.
+    # These remain unwired pending their own extractor enrichment:
     needed = [
-        ("ac_disconnects", "AC disconnect list (amp + fused + fuse_amp) from the PV-5 one-line"),
-        ("dc_disconnects", "DC disconnect pole counts from the PV-5 one-line"),
-        ("breakers_csr", "breakers drawn on the one-line (bus-kit / CSR / interconnection) by rating+poles"),
-        ("supply_side_taps", "the raw PV-5 one-line text (for K4977 / IT-3/0 / IT-250 tap lugs)"),
-        ("gateway_ground_bar", "Tesla Gateway count + backup-switch presence (rows 22/54/57)"),
         ("racking", "per-array orientation (rotated raster), the planset racking BOM table, and attachment type"),
         ("jboxes", "strings-per-array split by roof type (shingle/rail/metal/ground)"),
         ("micro_accessories", "microinverter SKU + branch-circuit count (Enphase Engage/combiner rows)"),
-        ("meter_sku_and_new_flag", "the meter EQUIPMENT SKU + a NEW-meter-drawn boolean (row 81-96 + special-order)"),
-        ("msp_sku_and_new_flag", "the MSP EQUIPMENT SKU + a NEW-MSP-drawn boolean (rows 73-79 + special-order)"),
+        ("homeline_msp_breaker", "a NEW Homeline MSP interconnection breaker (row-128 fallback) — "
+                                 "deferred: its special-order format writes distinct B/C and needs a "
+                                 "bom_writer change"),
     ]
     return [{"level": "NOTE", "item": f"extractor_missing:{item}",
              "msg": f"Not auto-populated — the v2 extractor's PlansetData does not surface {what}. "
