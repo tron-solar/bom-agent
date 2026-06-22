@@ -96,23 +96,46 @@ class PlansetExtractor:
     using Claude Vision.
     """
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, debug_pages_dir: Optional[str] = None):
         self.api_key = api_key or os.environ["ANTHROPIC_API_KEY"]
         self.headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
+        # DIAGNOSTIC (opt-in): when set via arg or EXTRACTOR_DEBUG_PAGES_DIR, every page rendered for
+        # Vision is saved here at the SAME 2x render the model sees, plus a _manifest.txt recording
+        # which page index each label resolved to. Unset in production -> nothing is written.
+        self.debug_pages_dir = debug_pages_dir or os.environ.get("EXTRACTOR_DEBUG_PAGES_DIR") or None
+        self._manifest = None
+        if self.debug_pages_dir:
+            os.makedirs(self.debug_pages_dir, exist_ok=True)
+            self._manifest = os.path.join(self.debug_pages_dir, "_manifest.txt")
+            with open(self._manifest, "w", encoding="utf-8") as fh:
+                fh.write("Page label resolution + saved images (2x render — exactly what Vision saw)\n\n")
 
-    def _pdf_page_to_base64(self, pdf_path: str, page_number: int) -> str:
-        """Extract a single page from PDF and return as base64 PNG."""
+    def _dbg(self, line: str) -> None:
+        if self._manifest:
+            with open(self._manifest, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+
+    def _pdf_page_to_base64(self, pdf_path: str, page_number: int, label: Optional[str] = None) -> str:
+        """Render a single PDF page to a base64 PNG. If debug dumping is on, also save the EXACT PNG
+        bytes (and a manifest line) so we can eyeball what the model actually saw."""
         doc = fitz.open(pdf_path)
         page = doc[page_number]
-        # Render at 2x resolution for better OCR
+        # Render at 2x resolution (UNCHANGED — the diagnostic saves exactly this, not a higher res).
         mat = fitz.Matrix(2.0, 2.0)
         pix = page.get_pixmap(matrix=mat)
         img_bytes = pix.tobytes("png")
         doc.close()
+        if self.debug_pages_dir and label:
+            safe = "".join(c if (c.isalnum() or c in "-._") else "_" for c in label)
+            fn = os.path.join(self.debug_pages_dir, f"selected_{safe}.png")
+            with open(fn, "wb") as fh:
+                fh.write(img_bytes)
+            self._dbg(f"[{label}] SAVED page index {page_number} -> {os.path.basename(fn)} "
+                      f"({pix.width}x{pix.height}px @2x)")
         return base64.standard_b64encode(img_bytes).decode("utf-8")
 
     def extract_page_pdf(self, pdf_path: str, label: str, output_path: str) -> bool:
@@ -142,9 +165,15 @@ class PlansetExtractor:
         for i, page in enumerate(doc):
             text = page.get_text()
             if label in text:
+                pos = text.find(label)
+                snippet = " ".join(text[max(0, pos - 30):pos + 40].split())
                 doc.close()
+                log.info("find_page_by_label(%r) -> page index %d (matched on: %r)", label, i, snippet)
+                self._dbg(f"[{label}] resolved to PAGE INDEX {i}  (matched text: {snippet!r})")
                 return i
         doc.close()
+        log.warning("find_page_by_label(%r) -> NOT FOUND; caller will use a fallback page", label)
+        self._dbg(f"[{label}] NOT FOUND by label — caller falls back to a fixed page index")
         return None
 
     async def _call_claude(self, images_b64: list, prompt: str) -> str:
@@ -225,7 +254,7 @@ class PlansetExtractor:
         warnings = []
 
         # --- Step 1: Extract cover sheet (PV-1, always page 0) ---
-        cover_b64 = self._pdf_page_to_base64(pdf_path, 0)
+        cover_b64 = self._pdf_page_to_base64(pdf_path, 0, label="PV-1_cover")
         cover_data = await self._extract_cover_sheet(cover_b64)
 
         # --- Step 2: Extract three-line diagram (PV-5) ---
@@ -233,7 +262,7 @@ class PlansetExtractor:
         if pv5_page is None:
             pv5_page = 4
             warnings.append("PV-5 page not found by label; using fallback page 4")
-        pv5_b64 = self._pdf_page_to_base64(pdf_path, pv5_page)
+        pv5_b64 = self._pdf_page_to_base64(pdf_path, pv5_page, label="PV-5")
         electrical_data = await self._extract_three_line(pv5_b64)
 
         # --- Step 3: Extract roof plan (PV-3) ---
@@ -241,7 +270,7 @@ class PlansetExtractor:
         if pv3_page is None:
             pv3_page = 2
             warnings.append("PV-3 page not found by label; using fallback page 2")
-        pv3_b64 = self._pdf_page_to_base64(pdf_path, pv3_page)
+        pv3_b64 = self._pdf_page_to_base64(pdf_path, pv3_page, label="PV-3")
         module_wattage = cover_data.get("module_wattage", 400)
         array_data = await self._extract_roof_plan(pv3_b64, module_wattage)
 
@@ -251,7 +280,7 @@ class PlansetExtractor:
             # some plansets put the string map on PV-3 itself
             pv31_page = pv3_page
             warnings.append("PV-3.1 page not found by label; using PV-3 page for string map")
-        pv31_b64 = self._pdf_page_to_base64(pdf_path, pv31_page)
+        pv31_b64 = self._pdf_page_to_base64(pdf_path, pv31_page, label="PV-3.1")
         string_data = await self._extract_string_map(pv31_b64)
 
         # --- Step 4: Resolve expansion mount kit (plans -> master note -> default wall) ---

@@ -57,12 +57,20 @@ def main() -> int:
         except (AttributeError, ValueError):
             pass
 
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+
     _load_dotenv(ROOT / ".env")
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
     # Host the DRAFT locally; never to a Railway volume. Must be set BEFORE importing app.config.
     os.environ["FILE_STORAGE_DIR"] = out_dir
     os.environ.setdefault("PUBLIC_BASE_URL", "http://dry-run.local")
+    # DIAGNOSTIC: dump every page the extractor renders for Vision (exact 2x PNG) + a manifest of
+    # label->page resolutions, so we can eyeball whether "PV-5" is the real one-line and if it's legible.
+    pages_dir = os.path.join(out_dir, "pages")
+    import shutil as _sh; _sh.rmtree(pages_dir, ignore_errors=True)
+    os.environ["EXTRACTOR_DEBUG_PAGES_DIR"] = pages_dir
     sys.path.insert(0, str(ROOT))
 
     if not os.environ.get("COPERNIQ_API_KEY"):
@@ -111,6 +119,11 @@ def main() -> int:
     print(f"[DRY-RUN] DRAFT xlsx on disk: {xlsx or '(none — see the comment above for why)'}")
     print(f"[DRY-RUN] {len(captured['files'])} file(s) + {len(captured['comments'])} comment(s) "
           f"would have been sent to Coperniq.")
+    pages = sorted(glob.glob(os.path.join(pages_dir, "*.png")))
+    print(f"\n[DRY-RUN] rendered page images (exact 2x the model saw) in {pages_dir}:")
+    for p in pages:
+        print(f"    {os.path.basename(p)}")
+    print(f"    _manifest.txt  (label -> page index resolutions)")
     return 0
 
 
