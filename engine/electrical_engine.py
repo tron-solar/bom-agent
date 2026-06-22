@@ -347,6 +347,22 @@ _MODULE_CONFIRMED_SUB = {
 }
 
 
+def _norm_module_sku(s) -> str:
+    """Normalize a module SKU for matching: uppercase, drop a TRAILING wattage token (handles every
+    form the table uses — ' 450W', '-450', '-460W', '410W'), then remove all spaces and hyphens.
+
+    This makes a format-only difference like the planset's 'ELNSM54M-HC-N 450W' compare equal to the
+    table key 'ELNSM54M-HC-N-450', turning a false HARD hold into a clean match. Only a *trailing*
+    digit run is treated as wattage, so embedded model digits (T440NF, BF10, G10) stay intact and
+    genuinely different modules don't collide. Real cross-model wattage swaps (e.g. 430->440, where
+    the digits are mid-token) still miss the table and fall through to the confirmed-substitution path.
+    """
+    s = str(s or "").upper().strip()
+    s = re.sub(r"[\s_\-]*\d{2,4}\s*W?\s*$", "", s)   # trailing wattage token (W optional)
+    s = re.sub(r"[\s\-]+", "", s)                     # remaining spaces / hyphens
+    return s
+
+
 def solar_module(module_pn, module_count):
     """Solar module line (Solar BOM rows 5-9). Returns (rows, flags).
 
@@ -365,15 +381,14 @@ def solar_module(module_pn, module_count):
                                 "SKU from PV-3 / PV-7; do not guess."})
         return rows, flags
 
-    norm = lambda s: " ".join(str(s).upper().split()).strip()
-    key = norm(module_pn)
+    key = _norm_module_sku(module_pn)
 
-    table = {norm(k): v for k, v in _MODULE_SKU_ROW.items()}
+    table = {_norm_module_sku(k): v for k, v in _MODULE_SKU_ROW.items()}
     if key in table:
         rows[table[key]] = int(module_count)
         return rows, flags
 
-    subs = {norm(k): v for k, v in _MODULE_CONFIRMED_SUB.items()}
+    subs = {_norm_module_sku(k): v for k, v in _MODULE_CONFIRMED_SUB.items()}
     if key in subs:
         sub_row, sub_sku, reason = subs[key]
         rows[sub_row] = int(module_count)
