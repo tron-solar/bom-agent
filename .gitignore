@@ -10,3 +10,5 @@ data/
 *.tmp
 # local Claude Code settings (per-machine)
 .claude/
+# local dry-run output (DRAFT xlsx written by tools/dry_run_bom.py)
+dry_run_out/
