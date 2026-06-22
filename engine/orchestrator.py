@@ -140,6 +140,21 @@ def _build_blocks(planset, project: dict):
     _run_block("main_service_panel", flags, elec_rows,
                lambda: ee.main_service_panel(bool(elec.get("new_msp_drawn")), elec.get("msp_pn")), elec_special)
 
+    # --- Completeness gates: a PV-5 read that came back but is missing CORE items is an extraction
+    #     miss, not a clean BOM. These encode physical install invariants so an implausibly-empty
+    #     electrical core HARD-holds for review instead of reading "ready". ---
+    if elec:
+        if not elec.get("ac_disconnects"):
+            flags.append({"level": "HARD", "item": "no_ac_disconnect_read",
+                          "msg": "No AC disconnect was read from PV-5, but a grid-tied PV system has at "
+                                 "least one. Extraction is likely incomplete — verify the PV-5 page and "
+                                 "the one-line before using this BOM."})
+        if battery_count > 0 and not gateway_count and not backup_switch:
+            flags.append({"level": "HARD", "item": "battery_no_gateway_or_backup",
+                          "msg": f"{battery_count} battery unit(s) read but neither a Tesla Gateway nor a "
+                                 "Backup Switch — implausible for an ESS. The PV-5 electrical read is "
+                                 "likely incomplete; verify before use."})
+
     # --- Blocks still NOT auto-fed by the v2 extractor: flag, do NOT guess ---
     flags += _missing_input_flags(planset)
 
