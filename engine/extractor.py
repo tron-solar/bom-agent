@@ -7,12 +7,17 @@ Part of the planset-extractor skill.
 """
 
 import os
-import base64
+import ssl
 import json
+import base64
+import asyncio
+import logging
 import httpx
 from dataclasses import dataclass, field
 from typing import Optional
 import fitz  # PyMuPDF
+
+log = logging.getLogger("extractor")
 
 
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
@@ -151,27 +156,56 @@ class PlansetExtractor:
             })
         content.append({"type": "text", "text": prompt})
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                CLAUDE_API_URL,
-                headers=self.headers,
-                json={
-                    "model": CLAUDE_MODEL,
-                    "max_tokens": 2000,
-                    "messages": [{"role": "user", "content": content}],
-                },
-                timeout=60,
-            )
-            response.raise_for_status()
-            return response.json()["content"][0]["text"]
+        payload = {
+            "model": CLAUDE_MODEL,
+            # 4000 (was 2000): the roof-plan JSON can list many arrays; 2000 risked truncating it
+            # into invalid JSON. Output tokens are billed only as used, so the headroom is ~free.
+            "max_tokens": 4000,
+            "messages": [{"role": "user", "content": content}],
+        }
+
+        # Retry transient connection corruption (e.g. SSLV3_ALERT_BAD_RECORD_MAC). Extraction makes
+        # ~4 sequential Vision calls; one flaky connection should not fail the whole run. 4 attempts,
+        # exponential backoff 1s/2s/4s, re-raise only on the final attempt.
+        retryable = (ssl.SSLError, httpx.TransportError, httpx.ConnectError, httpx.ReadError)
+        for attempt in range(4):
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        CLAUDE_API_URL, headers=self.headers, json=payload, timeout=60,
+                    )
+                    response.raise_for_status()
+                    return response.json()["content"][0]["text"]
+            except retryable as e:
+                if attempt == 3:
+                    raise
+                delay = 2 ** attempt  # 1s, 2s, 4s
+                log.warning("Vision call failed (%s: %s); retry %d/3 in %ds",
+                            type(e).__name__, e, attempt + 1, delay)
+                await asyncio.sleep(delay)
 
     def _parse_json(self, raw: str) -> dict:
-        """Parse JSON from Claude response, stripping markdown fences if present."""
-        clean = raw.strip()
+        """Parse JSON from a Claude response.
+
+        Strips markdown code fences, then extracts the object from the first '{' to the last '}'
+        (drops any prose the model wrapped around the JSON). On failure raises ValueError WITH the
+        raw response text included, so the caller/logs show what the model actually returned."""
+        clean = (raw or "").strip()
         if clean.startswith("```"):
-            lines = clean.split("\n")
-            clean = "\n".join(lines[1:-1])
-        return json.loads(clean)
+            clean = clean.split("\n", 1)[-1]          # drop the opening ``` / ```json line
+            if clean.rstrip().endswith("```"):
+                clean = clean.rstrip()[:-3]           # drop the closing fence
+            clean = clean.strip()
+        start, end = clean.find("{"), clean.rfind("}")
+        if start != -1 and end > start:
+            clean = clean[start:end + 1]
+        try:
+            return json.loads(clean)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Claude response was not valid JSON ({e}). "
+                f"Raw response (first 1000 chars): {(raw or '')[:1000]!r}"
+            ) from e
 
     async def extract(self, pdf_path: str, coperniq_project: Optional[dict] = None,
                       master_note_form: Optional[dict] = None) -> PlansetData:
@@ -387,7 +421,14 @@ Rules:
 - Return at least one array even if details are unclear"""
 
         raw = await self._call_claude([image_b64], prompt)
-        return self._parse_json(raw)
+        try:
+            return self._parse_json(raw)
+        except (ValueError, json.JSONDecodeError) as e:
+            # PV-3 has been the call that returns empty / non-JSON. Log the raw response, attributed
+            # to the roof-plan step, so we can see exactly what the model returned before it raises.
+            log.error("PV-3 roof-plan parse failed: %s", e)
+            log.error("PV-3 raw response (first 1000 chars): %r", (raw or "")[:1000])
+            raise
 
     def _merge(
         self,
