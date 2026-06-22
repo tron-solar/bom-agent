@@ -56,13 +56,34 @@ def _addr(project: dict) -> str:
     return a[0] if isinstance(a, list) and a else (a or "")
 
 
+def _run_block(label, flags, target_rows, fn, target_special=None):
+    """Run ONE engine block and merge its output. A block that RAISES (import error, runtime error)
+    becomes a HARD flag here — never a crash, never a silent drop. This is the load-bearing rule:
+    a swallowed failure must HOLD the BOM, not produce a 'ready for review' draft missing content.
+    Accepts blocks that return (rows, flags) or (rows, flags, special_order)."""
+    try:
+        out = fn()
+        if isinstance(out, tuple) and len(out) == 3:
+            rows, blk_flags, special = out
+        else:
+            rows, blk_flags = out
+            special = None
+        bom_writer.merge_block(target_rows, rows or {})
+        if special and target_special is not None:
+            bom_writer.merge_special(target_special, special)
+        flags.extend(blk_flags or [])
+    except Exception as e:  # noqa: BLE001 — any block failure must surface as a HARD flag
+        flags.append({"level": "HARD", "item": f"block_failed:{label}",
+                      "msg": f"Engine block {label!r} failed to run ({type(e).__name__}: {e}). "
+                             f"This line could not be computed — build it manually and report the error."})
+
+
 def _build_blocks(planset, project: dict):
     """Drive the engine blocks from the extracted PlansetData. Returns
     (solar_rows, electrical_rows, solar_special, electrical_special, flags).
 
-    Each electrical_engine block returns its own {row: qty} (+ flags, + special-order map for the
-    meter/MSP lines); we merge them with bom_writer.merge_block / merge_special, exactly as the
-    consolidated builder in docs/pipeline_create_bom.py prescribes.
+    Every block goes through _run_block so a raised exception becomes a HARD flag rather than
+    crashing the run or silently dropping the line.
     """
     solar_rows: dict[int, int] = {}
     elec_rows: dict[int, int] = {}
@@ -70,16 +91,13 @@ def _build_blocks(planset, project: dict):
     elec_special: dict[int, str] = {}
     flags: list[dict] = []
 
-    # --- Module line (Solar rows 5-9) — fully drivable from PlansetData ---
-    r, f = ee.solar_module(planset.module_model, planset.module_quantity)
-    bom_writer.merge_block(solar_rows, r)
-    flags += f
+    # --- Module line (Solar rows 5-9) ---
+    _run_block("solar_module", flags, solar_rows,
+               lambda: ee.solar_module(planset.module_model, planset.module_quantity), solar_special)
 
     # --- RSD device (Electrical row 19) = ceil(batteries/3); PW3 expansion excluded ---
     battery_count = int(planset.battery_quantity or 0)
-    r, f = ee.rsd_device(battery_count)
-    bom_writer.merge_block(elec_rows, r)
-    flags += f
+    _run_block("rsd_device", flags, elec_rows, lambda: ee.rsd_device(battery_count))
 
     # ===== PV-5 ELECTRICAL BLOCKS (driven by extractor.PlansetData.electrical) =====
     elec = getattr(planset, "electrical", None) or {}
@@ -89,52 +107,38 @@ def _build_blocks(planset, project: dict):
                              "breakers, meter, and MSP could not be auto-populated — build the "
                              "Electrical sheet manually and verify against PV-5."})
 
-    # AC disconnects (rows 5-12) + hubs (13-15) + fuses (130-144)
-    if elec.get("ac_disconnects"):
-        r, f = ee.ac_disconnects(elec["ac_disconnects"])
-        bom_writer.merge_block(elec_rows, r); flags += f
-
-    # DC disconnects (rows 17-18) by pole count
-    if elec.get("dc_disconnects"):
-        r, f = ee.dc_disconnects(elec["dc_disconnects"])
-        bom_writer.merge_block(elec_rows, r); flags += f
-
-    # Supply-side taps (rows 26-28) — substring match on the raw one-line text
-    if elec.get("one_line_text"):
-        r, f = ee.supply_side_taps(elec["one_line_text"])
-        bom_writer.merge_block(elec_rows, r); flags += f
+    if elec.get("ac_disconnects"):                 # rows 5-12 + hubs 13-15 + fuses 130-144
+        _run_block("ac_disconnects", flags, elec_rows, lambda: ee.ac_disconnects(elec["ac_disconnects"]))
+    if elec.get("dc_disconnects"):                 # rows 17-18 by pole count
+        _run_block("dc_disconnects", flags, elec_rows, lambda: ee.dc_disconnects(elec["dc_disconnects"]))
+    if elec.get("one_line_text"):                  # rows 26-28 supply-side taps (substring match)
+        _run_block("supply_side_taps", flags, elec_rows, lambda: ee.supply_side_taps(elec["one_line_text"]))
 
     # Tesla PW3 / Gateway / Backup switch / inverter / remote meter (rows 51-57)
     pw3_skus = elec.get("pw3_skus") or []
     gateway_count = int(elec.get("gateway_count") or 0)
     backup_switch = bool(elec.get("backup_switch"))
     if pw3_skus or gateway_count or backup_switch or elec.get("inverter_sku") or elec.get("remote_meter_count"):
-        r, f = ee.tesla_core(pw3_skus=pw3_skus, gateway_count=gateway_count,
-                             backup_switch=backup_switch, inverter_sku=elec.get("inverter_sku"),
-                             remote_meter_count=int(elec.get("remote_meter_count") or 0))
-        bom_writer.merge_block(elec_rows, r); flags += f
+        _run_block("tesla_core", flags, elec_rows,
+                   lambda: ee.tesla_core(pw3_skus=pw3_skus, gateway_count=gateway_count,
+                                         backup_switch=backup_switch, inverter_sku=elec.get("inverter_sku"),
+                                         remote_meter_count=int(elec.get("remote_meter_count") or 0)))
 
-    # Ground bar (row 22) — one per Tesla Gateway
     if gateway_count:
-        r, f = ee.ground_bar(gateway_count)
-        bom_writer.merge_block(elec_rows, r); flags += f
-
-        # Gateway breakers: bus-kit BR (98-110) / CSR mains (112-114). Only on gateway projects.
+        _run_block("ground_bar", flags, elec_rows, lambda: ee.ground_bar(gateway_count))  # row 22
         buskit = [(int(b["amp"]), int(b["poles"]))
                   for b in (elec.get("buskit_breakers") or []) if b.get("amp") and b.get("poles")]
         csr = [int(a) for a in (elec.get("csr_breakers") or []) if a]
-        r, f = re_eng.tesla_gateway_breakers(buskit, csr,
-                                             battery_pw3_count=(len(pw3_skus) or battery_count))
-        bom_writer.merge_block(elec_rows, r); flags += f
+        _run_block("tesla_gateway_breakers", flags, elec_rows,           # BR 98-110 / CSR 112-114
+                   lambda: re_eng.tesla_gateway_breakers(buskit, csr,
+                                                         battery_pw3_count=(len(pw3_skus) or battery_count)))
 
-    # Meter line + special-order P/N (rows 81-96). Ordered ONLY if a NEW meter is drawn; an unmapped
-    # P/N routes to row 96 with the SKU stamped into BOTH col B and C (bom_writer special-order map).
-    r, f, sp = ee.meter_socket(bool(elec.get("new_meter_drawn")), elec.get("meter_pn"))
-    bom_writer.merge_block(elec_rows, r); bom_writer.merge_special(elec_special, sp); flags += f
-
-    # MSP line + special-order P/N (rows 73-79). Same gating: new MSP only; unmapped -> row 79 stamped.
-    r, f, sp = ee.main_service_panel(bool(elec.get("new_msp_drawn")), elec.get("msp_pn"))
-    bom_writer.merge_block(elec_rows, r); bom_writer.merge_special(elec_special, sp); flags += f
+    # Meter line + special-order P/N (rows 81-96): NEW meter only; unmapped P/N -> row 96 stamped B+C.
+    _run_block("meter_socket", flags, elec_rows,
+               lambda: ee.meter_socket(bool(elec.get("new_meter_drawn")), elec.get("meter_pn")), elec_special)
+    # MSP line + special-order P/N (rows 73-79): NEW MSP only; unmapped -> row 79 stamped.
+    _run_block("main_service_panel", flags, elec_rows,
+               lambda: ee.main_service_panel(bool(elec.get("new_msp_drawn")), elec.get("msp_pn")), elec_special)
 
     # --- Blocks still NOT auto-fed by the v2 extractor: flag, do NOT guess ---
     flags += _missing_input_flags(planset)
@@ -201,6 +205,16 @@ def build_bom(planset_pdf_path: str, coperniq_project_dict: dict) -> tuple[bytes
                          "list_project_forms/get_form), so expansion mount/stack resolution is "
                          "unavailable. Wire the form fetch to enable it."})
 
+    # 2b) Surface extraction-time issues as FLAGS, not a buried warnings list. Anything that looks
+    #     like a failure (import/parse/exception) is HARD — a swallowed error must never read as
+    #     "ready for review"; benign notices (fallback page used, mount defaulted) are SOFT but visible.
+    _ERR_MARKERS = ("fail", "error", "exception", "no module named", "traceback", "could not", "unparseable")
+    for w in (getattr(planset, "extraction_warnings", []) or []):
+        is_err = any(k in str(w).lower() for k in _ERR_MARKERS)
+        flags.append({"level": "HARD" if is_err else "NOTE",
+                      "item": "extraction_error" if is_err else "extraction_warning",
+                      "msg": str(w)})
+
     # 3) WRITE the BOM via the canonical writer (static qtys + special-order P/N stamping into B AND C).
     tmpdir = tempfile.mkdtemp()
     out_path = os.path.join(tmpdir, "bom.xlsx")
@@ -220,12 +234,28 @@ def build_bom(planset_pdf_path: str, coperniq_project_dict: dict) -> tuple[bytes
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-    # 4) CONFIDENCE
+    # 4) CONFIDENCE — echo the PARSED PV-5 electrical reads so the report shows what extraction
+    #    produced (vs. what a block then did with it). If a row is empty here, extraction missed it.
+    el = getattr(planset, "electrical", {}) or {}
     confidence["FLAGS_FOR_HUMAN_REVIEW"] = _normalize_flags(flags)
     confidence["extraction"] = {
         "module_model": planset.module_model,
         "module_quantity": planset.module_quantity,
         "battery_quantity": planset.battery_quantity,
         "warnings": list(getattr(planset, "extraction_warnings", []) or []),
+        "electrical": {
+            "ac_disconnects": el.get("ac_disconnects"),
+            "dc_disconnects": el.get("dc_disconnects"),
+            "buskit_breakers": el.get("buskit_breakers"),
+            "csr_breakers": el.get("csr_breakers"),
+            "gateway_count": el.get("gateway_count"),
+            "backup_switch": el.get("backup_switch"),
+            "pw3_skus": el.get("pw3_skus"),
+            "new_meter_drawn": el.get("new_meter_drawn"),
+            "meter_pn": el.get("meter_pn"),
+            "new_msp_drawn": el.get("new_msp_drawn"),
+            "msp_pn": el.get("msp_pn"),
+            "one_line_text_present": bool(el.get("one_line_text")),
+        },
     }
     return data, confidence

@@ -259,13 +259,13 @@ class PlansetExtractor:
         master_notes = None
         if coperniq_project is not None or master_note_form is not None:
             try:
-                from electrical_engine import master_notes_from_coperniq
+                from .electrical_engine import master_notes_from_coperniq
                 master_notes = master_notes_from_coperniq(project=coperniq_project,
                                                           form=master_note_form)
             except Exception as e:  # noqa: BLE001
                 warnings.append(f"master-note parse failed: {e}")
         try:
-            from electrical_engine import resolve_expansion_mount
+            from .electrical_engine import resolve_expansion_mount
             mount_kit = resolve_expansion_mount(plan_mount=plan_mount, master_notes=master_notes)
         except Exception:
             mount_kit = "wall"
