@@ -16,7 +16,9 @@ import fitz  # PyMuPDF
 
 
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+# Current Sonnet alias (no date suffix). The old dated snapshot claude-sonnet-4-20250514 retired
+# 2026-06-15 and now 404s. Override per-env without a code change via CLAUDE_MODEL.
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
 
 @dataclass
