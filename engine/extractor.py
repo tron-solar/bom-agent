@@ -185,6 +185,14 @@ class PlansetExtractor:
                     return True
         return False
 
+    @staticmethod
+    def _label_present(text: str, label: str) -> bool:
+        """True if `label` appears as an EXACT sheet number in text — not merely as a prefix of a
+        longer one. 'PV-5' matches 'PV-5' / 'PV-5 ELECTRICAL...' / 'PV-5.' but NOT 'PV-5.1' / 'PV-50',
+        and 'PV-3' does not match 'PV-3.1'. (Lookahead: not followed by an optional dot then a digit —
+        a sub-sheet '.1' or a trailing digit blocks it; a plain sentence period does not.)"""
+        return re.search(re.escape(label) + r"(?!\.?\d)", text or "") is not None
+
     def _find_page_by_label(self, pdf_path: str, label: str) -> Optional[int]:
         """Resolve a sheet label (e.g. 'PV-5') to its page index.
 
@@ -199,7 +207,7 @@ class PlansetExtractor:
         text_hits: list[tuple[int, int]] = []   # (distinct PV-N count on the page, page index)
         for i, page in enumerate(doc):
             text = page.get_text()
-            if label not in text:
+            if not self._label_present(text, label):   # exact sheet number: 'PV-5' != 'PV-5.1'
                 continue
             text_hits.append((len(set(re.findall(r"PV-\d+(?:\.\d+)?", text))), i))
             if self._label_in_title_block(page, label):
