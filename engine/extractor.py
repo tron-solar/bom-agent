@@ -148,6 +148,54 @@ class PlansetExtractor:
                       f"({pix.width}x{pix.height}px @{zoom:.2f}x)")
         return base64.standard_b64encode(img_bytes).decode("utf-8")
 
+    def _render_clip_base64(self, pdf_path: str, page_number: int, clip, label: Optional[str] = None) -> str:
+        """Render a CROPPED region of a page to base64 PNG. Because the clip is small, the long-edge
+        cap (2576px) doesn't bind at 3x, so a region crop gets full 3x — many more pixels per label
+        than the capped whole-sheet view. Saves the crop to the debug dir when dumping is on."""
+        doc = fitz.open(pdf_path)
+        try:
+            page = doc[page_number]
+            long_edge_pts = max(clip.width, clip.height) or 1.0
+            zoom = min(3.0, 2576 / long_edge_pts)
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip)
+            img_bytes = pix.tobytes("png")
+        finally:
+            doc.close()
+        if self.debug_pages_dir and label:
+            safe = "".join(c if (c.isalnum() or c in "-._") else "_" for c in label)
+            fn = os.path.join(self.debug_pages_dir, f"selected_{safe}.png")
+            with open(fn, "wb") as fh:
+                fh.write(img_bytes)
+            self._dbg(f"[{label}] SAVED crop of page {page_number} -> {os.path.basename(fn)} "
+                      f"({pix.width}x{pix.height}px @{zoom:.2f}x, clip={tuple(round(v) for v in clip)})")
+        return base64.standard_b64encode(img_bytes).decode("utf-8")
+
+    def _locate_buskit_region(self, pdf_path: str, page_number: int):
+        """Find the gateway / 'GATEWAY INTERNAL BUS-KIT' label in the page text layer and return a
+        generous clip Rect around it (the box + the breakers landing into the gateway). Prefers a
+        BUS-KIT label; falls back to GATEWAY. Returns None if neither is in the text layer."""
+        doc = fitz.open(pdf_path)
+        try:
+            page = doc[page_number]
+            rect = page.rect
+            W, H = rect.width, rect.height
+            if not W or not H:
+                return None
+            words = page.get_text("words")  # (x0,y0,x1,y1,word,...)
+        except Exception:  # noqa: BLE001
+            return None
+        finally:
+            doc.close()
+        buskit = [(x0, y0, x1, y1) for x0, y0, x1, y1, w, *_ in words
+                  if "BUS-KIT" in w.upper() or "BUSKIT" in w.upper()]
+        hits = buskit or [(x0, y0, x1, y1) for x0, y0, x1, y1, w, *_ in words if "GATEWAY" in w.upper()]
+        if not hits:
+            return None
+        cx = (min(h[0] for h in hits) + max(h[2] for h in hits)) / 2
+        cy = (min(h[1] for h in hits) + max(h[3] for h in hits)) / 2
+        hw, hh = 0.30 * W, 0.28 * H   # generous: capture the box + external CSR feed, don't clip breakers
+        return fitz.Rect(max(0, cx - hw), max(0, cy - hh), min(W, cx + hw), min(H, cy + hh))
+
     def extract_page_pdf(self, pdf_path: str, label: str, output_path: str) -> bool:
         """
         Extract a single labeled page (e.g. 'PV-5') from the planset and save
@@ -401,6 +449,40 @@ class PlansetExtractor:
         else:
             pv5_b64 = self._pdf_page_to_base64(pdf_path, pv5_page, label="PV-5")
             electrical_data = await self._extract_three_line(pv5_b64)
+
+        # --- Step 2.5: High-res bus-kit/breaker CROP (gateway projects). The breaker labels are below
+        # the whole-sheet legibility threshold; a focused 3x crop reads them reliably. The crop is
+        # AUTHORITATIVE for the breaker enumeration; the whole-sheet read is kept for the report. ---
+        if pv5_page is not None and electrical_data.get("gateway_count"):
+            ws_buskit = electrical_data.get("buskit_breakers") or []
+            ws_csr = electrical_data.get("csr_breakers") or []
+            electrical_data["buskit_wholesheet"] = ws_buskit
+            electrical_data["csr_wholesheet"] = ws_csr
+            region = self._locate_buskit_region(pdf_path, pv5_page)
+            crop = {}
+            if region is not None:
+                crop = await self._extract_buskit_breakers(
+                    self._render_clip_base64(pdf_path, pv5_page, region, label="PV-5_buskit_crop")) or {}
+            crop_buskit = crop.get("buskit_breakers") or []
+            crop_csr = crop.get("csr_breakers")
+            # ADDITIVE reconciliation, NOT blind crop-authority: the crop's region can mis-locate (and
+            # then under-reads), while the bus-kit failure mode is UNDERcount. So take whichever read
+            # enumerated MORE bus-kit breakers — a failed/partial crop can never clobber a fuller
+            # whole-sheet read. Carry that read's CSR with it.
+            if len(crop_buskit) > len(ws_buskit):
+                electrical_data["buskit_breakers"] = crop_buskit
+                electrical_data["csr_breakers"] = crop_csr if crop_csr is not None else ws_csr
+                electrical_data["buskit_source"] = "crop"
+            else:
+                electrical_data["buskit_breakers"] = ws_buskit
+                electrical_data["csr_breakers"] = ws_csr
+                electrical_data["buskit_source"] = ("whole_sheet" if region is not None
+                                                    else "whole_sheet (bus-kit label not found)")
+            if region is not None and crop_buskit != ws_buskit:
+                extraction_flags.append({
+                    "level": "NOTE", "item": "buskit_crop_vs_wholesheet",
+                    "msg": f"Bus-kit read differs: crop={crop_buskit} vs whole-sheet={ws_buskit}; used "
+                           f"{electrical_data['buskit_source']} (more complete). Verify the bus-kit on PV-5."})
 
         # --- Step 3: Extract roof plan (PV-3) — same HARD-fail policy ---
         pv3_page = self._find_page_by_label(pdf_path, "PV-3")
@@ -744,6 +826,30 @@ Rules — read the LABELS, not just the symbols:
             # minimal shape so the orchestrator flags missing electrical detail instead of crashing.
             log.error("PV-5 three-line parse failed: %s", e)
             log.error("PV-5 raw response (first 1000 chars): %r", (raw or "")[:1000])
+            return {}
+
+    async def _extract_buskit_breakers(self, image_b64: str) -> dict:
+        """Focused read of a HIGH-RES crop of the Tesla Gateway bus-kit zone. The crop has many more
+        pixels per breaker label than the whole sheet, so the small breaker symbols are legible."""
+        prompt = """This is a CROPPED, high-resolution view of the Tesla Gateway area on a PV-5 one-line.
+Return ONLY valid JSON, no other text:
+{ "buskit_breakers": [ {"amp": integer, "poles": integer} ], "csr_breakers": [ integer ] }
+
+- buskit_breakers: EVERY breaker SYMBOL drawn INSIDE the "GATEWAY INTERNAL BUS-KIT" box. Enumerate
+  them ALL — there is normally one 60A/2P per Powerwall PLUS possibly additional ratings (commonly a
+  100A/2P). Read each one's amp + poles from its label; do not omit any and do not invent any.
+- csr_breakers: ONLY a real breaker SYMBOL drawn OUTSIDE the bus-kit box, landing into the gateway
+  from the line side. Amperage only; [] if none.
+  * The gateway's ENCLOSURE rating label ("TESLA GATEWAY 3, 200A, NEMA 3R, 240/120V") is NOT a
+    breaker — do NOT list it as a CSR.
+  * The distinction is POSITIONAL, not by rating: a CSR's amperage often EQUALS the gateway rating,
+    so do not disqualify a breaker just because its rating matches the gateway. A breaker symbol
+    outside the bus-kit = CSR; the printed enclosure rating = not a breaker."""
+        raw = await self._call_claude([image_b64], prompt)
+        try:
+            return self._parse_json(raw)
+        except (ValueError, json.JSONDecodeError) as e:
+            log.error("bus-kit crop parse failed: %s", e)
             return {}
 
     async def _extract_roof_plan(self, image_b64: str, module_wattage: float) -> dict:
