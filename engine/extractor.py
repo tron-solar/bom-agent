@@ -520,10 +520,18 @@ Rules — read the LABELS, not just the symbols:
 - pw3_skus: one entry per Powerwall 3 unit drawn, using its 1707000-... SKU (EXCLUDE PW3 Expansion units).
 - inverter_sku: a standalone Tesla inverter SKU if drawn, else null.
 - remote_meter_count: count of "TESLA REMOTE ENERGY METER" blocks, else 0.
-- buskit_breakers: breakers drawn INSIDE the "GATEWAY INTERNAL BUS-KIT" enclosure (left side of the
-  gateway). One entry per breaker: {"amp", "poles"} read from its label (e.g. "60A/2P","100A/2P").
-- csr_breakers: amperages of rated MAIN breakers landing into the gateway from the RIGHT, OUTSIDE the
-  bus-kit (e.g. [200]). Empty if none. Do NOT include service-panel mains.
+- GATEWAY BREAKER CLASSIFICATION — read carefully, this is error-prone. The Tesla Gateway has an
+  internal BUS-KIT enclosure. Put each breaker in EXACTLY ONE of the two lists, never both:
+  * buskit_breakers ({"amp","poles"}): breakers drawn INSIDE the bus-kit box. There is normally ONE
+    60A/2P breaker PER Powerwall 3 inside the bus-kit (2 PW3 -> two {60,2} entries; 1 PW3 -> one
+    {60,2}). These small per-PW3 60A/2P breakers are EASY TO MISS — look for them specifically.
+  * csr_breakers ([amp]): a MAIN breaker landing into the gateway from OUTSIDE the bus-kit (the
+    line/right side), e.g. a 200A/2P service main. Record amperage only, e.g. [200]. This is the CSR.
+  * A 200A (or any) MAIN is a CSR, NOT a bus-kit breaker — do not also list it under buskit_breakers.
+  * Do NOT classify the EXISTING house-panel main (e.g. "(E) MAIN BREAKER TO HOUSE 200A/2P") as a
+    gateway breaker at all — it belongs in NEITHER list.
+  EXAMPLE — a 2-PW3 gateway fed by a 200A service main:
+    "buskit_breakers": [{"amp": 60, "poles": 2}, {"amp": 60, "poles": 2}], "csr_breakers": [200]
 - one_line_text: a verbatim transcription of the one-line's text labels/notes (so supply-side tap SKUs
   like "K4977", "NSI IT-3/0", "IT-250" can be matched). Keep it under ~1500 characters.
 - Use [] / 0 / false for absent items; null only for the string/number fields that say "or null"."""
