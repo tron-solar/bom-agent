@@ -580,9 +580,15 @@ Rules — read the LABELS, not just the symbols:
 - meter_number: the meter serial/ID near the meter symbol (NOT the meter equipment SKU).
 - service_type / nominal_voltage (use 240 for 120/240V) / main_panel_amperage / interconnection_method
   as before; null if not clearly visible.
-- ac_disconnects: ONE entry per AC disconnect drawn. "amp" = the disconnect rating; "fused" = true only
-  if the disconnect is labeled FUSED (read the label, e.g. "FUSED"/"NON-FUSED" or "PV/ESS DISCONNECT");
-  "fuse_amp" = the FUSE rating drawn inside the block (may differ from the disconnect amp), else null.
+- ac_disconnects: ONE entry per AC disconnect drawn. The DISCONNECT rating and the FUSE rating are
+  TWO DIFFERENT numbers — do not conflate them:
+  * "amp" = the DISCONNECT / switch / enclosure rating (e.g. "60A FUSED AC DISCONNECT" -> amp:60).
+  * "fused" = true if the disconnect is labeled FUSED (else false; read the label, e.g.
+    "FUSED"/"NON-FUSED", "PV/ESS DISCONNECT").
+  * "fuse_amp" = the FUSE size INSIDE the enclosure (e.g. "(2) 40A FUSES" -> fuse_amp:40), normally
+    LOWER than the disconnect rating; null if non-fused. If the disconnect rating and the fuse rating
+    come out EQUAL, re-read — they are usually different (a 60A disco commonly holds 40A fuses).
+  EXAMPLE: "60A FUSED AC DISCONNECT with (2) 40A FUSES" -> {"amp": 60, "fused": true, "fuse_amp": 40}.
 - dc_disconnects: ONE entry per DC disconnect; "poles" = pole count (2 = single string, 4 = two strings).
 - new_meter_drawn: true ONLY if the plan draws/specifies a NEW meter/socket/base (e.g. PV-1 scope or
   PV-5 note "UPGRADE METER BASE TO NEW ..."). An existing/retained meter -> false.
