@@ -125,8 +125,13 @@ class PlansetExtractor:
         bytes (and a manifest line) so we can eyeball what the model actually saw."""
         doc = fitz.open(pdf_path)
         page = doc[page_number]
-        # Render at 2x resolution (UNCHANGED — the diagnostic saves exactly this, not a higher res).
-        mat = fitz.Matrix(2.0, 2.0)
+        # Render at 3x for legibility of small breaker/disconnect labels, but cap the long edge at
+        # 2576px (Sonnet 4.6's high-res ceiling) — scale to fit rather than overshoot. On an ANSI B
+        # (11x17) sheet the long edge is ~1224pt, so the cap binds and the effective zoom is ~2.1x.
+        MAX_LONG_EDGE_PX = 2576
+        long_edge_pts = max(page.rect.width, page.rect.height) or 1.0
+        zoom = min(3.0, MAX_LONG_EDGE_PX / long_edge_pts)
+        mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat)
         img_bytes = pix.tobytes("png")
         doc.close()
@@ -136,7 +141,7 @@ class PlansetExtractor:
             with open(fn, "wb") as fh:
                 fh.write(img_bytes)
             self._dbg(f"[{label}] SAVED page index {page_number} -> {os.path.basename(fn)} "
-                      f"({pix.width}x{pix.height}px @2x)")
+                      f"({pix.width}x{pix.height}px @{zoom:.2f}x)")
         return base64.standard_b64encode(img_bytes).decode("utf-8")
 
     def extract_page_pdf(self, pdf_path: str, label: str, output_path: str) -> bool:
