@@ -127,14 +127,12 @@ def _build_blocks(planset, project: dict):
     if gateway_count:
         _run_block("ground_bar", flags, elec_rows, lambda: ee.ground_bar(gateway_count))  # row 22
         pw3_count = len(pw3_skus) or battery_count
-        # One 60A/2P bus-kit breaker PER Powerwall 3, derived from the authoritative PW3 count (the
-        # per-PW3 breakers are easy to miss / mis-count in the schematic). Keep any OTHER bus-kit
-        # breakers Vision read (e.g. a non-60A/2P), and the gate then reconciles against the real count.
-        other_buskit = [(int(b["amp"]), int(b["poles"]))
-                        for b in (elec.get("buskit_breakers") or [])
-                        if b.get("amp") and b.get("poles")
-                        and not (int(b["amp"]) == 60 and int(b["poles"]) == 2)]
-        buskit = [(60, 2)] * pw3_count + other_buskit
+        # Read EVERY bus-kit breaker straight from the plan (Vision) — the 60A/2P-per-PW3 ones AND any
+        # additional ratings (e.g. 100A/2P -> BR2100). The engine's gate reconciles the 60A/2P count
+        # against PW3; other ratings are legitimate and don't trip it. (CSR note cross-check is done in
+        # the extractor as csr_note_conflict, so master_note_csr is left unset here.)
+        buskit = [(int(b["amp"]), int(b["poles"]))
+                  for b in (elec.get("buskit_breakers") or []) if b.get("amp") and b.get("poles")]
         csr = [int(a) for a in (elec.get("csr_breakers") or []) if a]
         _run_block("tesla_gateway_breakers", flags, elec_rows,           # BR 98-110 / CSR 112-114
                    lambda: re_eng.tesla_gateway_breakers(buskit, csr, battery_pw3_count=pw3_count))
@@ -306,6 +304,9 @@ def build_bom(planset_pdf_path: str, coperniq_project_dict: dict,
             "harness_pn": el.get("harness_pn"),
             "harness_source": el.get("harness_source"),
             "expansion_mount": el.get("expansion_mount"),
+            "buskit_breakers": el.get("buskit_breakers"),
+            "csr_breakers": el.get("csr_breakers"),
+            "csr_note_check": el.get("csr_note_check"),
             "one_line_text": el.get("one_line_text"),
         },
     }

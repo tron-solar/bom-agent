@@ -355,6 +355,24 @@ class PlansetExtractor:
         m = re.search(r"1875157[\s\-]{0,3}(05|20|40)", str(text).upper())
         return m.group(1) if m else None
 
+    @staticmethod
+    def _parse_note_csr(text: str):
+        """Parse a Master Note for an explicit CSR statement. Returns (kind, amps):
+          ('none', [])   -> note explicitly says NO CSR breaker
+          ('amps', [N..]) -> note states one or more CSR amperages
+          (None, [])     -> note is silent on CSR (no reconciliation)."""
+        t = (text or "").upper()
+        if "CSR" not in t:
+            return None, []
+        if re.search(r"\bNO\s+CSR\b", t):
+            return "none", []
+        amps = []
+        for m in re.finditer(r"(\d{2,3})\s*A?\s*CSR|CSR\s*(?:BREAKER\s*)?(\d{2,3})\s*A?", t):
+            a = m.group(1) or m.group(2)
+            if a:
+                amps.append(int(a))
+        return ("amps", sorted(set(amps))) if amps else (None, [])
+
     async def extract(self, pdf_path: str, coperniq_project: Optional[dict] = None,
                       master_note_form: Optional[dict] = None) -> PlansetData:
         """
@@ -471,16 +489,18 @@ class PlansetExtractor:
             warnings.append("expansion mount: no plan keyword and no Master Note form supplied; "
                             "defaulted to wall — fetch get_form(Master Note) and pass master_note_form")
 
+        # Shared Master Note text (used by the harness + CSR cross-checks below).
+        mn_text = ""
+        if isinstance(master_notes, dict):
+            mn_text = " ".join(str(master_notes.get(k, "") or "") for k in
+                               ("design_notes", "additional_notes", "installation_notes",
+                                "field_installation_notes"))
+
         # --- Step 4.1: Multi-source expansion HARNESS resolution (only when there is an expansion) ---
         # 1 direct Vision harness_pn field; 2 regex over the FULL one-line text; 3 Master Note text.
         # Deliver the first that yields a length code (05/20/40); conflict -> HARD; none -> leave it
         # null so tesla_expansion raises expansion_harness_pn_missing (never guess).
         if electrical_data.get("expansion_count"):
-            mn_text = ""
-            if isinstance(master_notes, dict):
-                mn_text = " ".join(str(master_notes.get(k, "") or "") for k in
-                                   ("design_notes", "additional_notes", "installation_notes",
-                                    "field_installation_notes"))
             by_source = {
                 "direct_field": self._extract_harness_code(electrical_data.get("harness_pn") or ""),
                 "one_line_text": self._extract_harness_code(electrical_data.get("one_line_text") or ""),
@@ -502,6 +522,25 @@ class PlansetExtractor:
                         "msg": f"Expansion harness resolved to 1875157-{resolved} from {src}."})
             else:
                 electrical_data["harness_source"] = None
+
+        # --- Step 4.2: CSR vs Master Note cross-check (gateway projects). The plan one-line is
+        # authoritative for the delivered CSR; the note only forces a human verify when it disagrees
+        # (catches a dropped or hallucinated CSR). Never overrides the plan. ---
+        if electrical_data.get("gateway_count"):
+            plan_csr = [int(a) for a in (electrical_data.get("csr_breakers") or []) if a]
+            kind, note_amps = self._parse_note_csr(mn_text)
+            electrical_data["csr_note_check"] = {"note": kind, "note_amps": note_amps, "plan_csr": plan_csr}
+            if kind == "none" and plan_csr:
+                extraction_flags.append({
+                    "level": "HARD", "item": "csr_note_conflict",
+                    "msg": f"Master Note says NO CSR breaker, but the one-line read CSR {plan_csr}A. "
+                           f"Verify PV-5 — plan is authoritative, but one of these is wrong."})
+            elif kind == "amps" and set(note_amps) != set(plan_csr):
+                extraction_flags.append({
+                    "level": "HARD", "item": "csr_note_conflict",
+                    "msg": f"Master Note states CSR {note_amps}A but the one-line read CSR "
+                           f"{plan_csr or 'none'}. Verify PV-5 (a CSR main may be dropped or misread). "
+                           f"Plan remains authoritative; this is a hold, not an override."})
 
         # --- Merge and return ---
         planset = self._merge(cover_data, electrical_data, array_data,
@@ -676,16 +715,22 @@ Rules — read the LABELS, not just the symbols:
 - expansion_mount: "stack" or "wall" only if a mount keyword is written near the expansion unit, else null.
 - GATEWAY BREAKER CLASSIFICATION — read carefully, this is error-prone. The Tesla Gateway has an
   internal BUS-KIT enclosure. Put each breaker in EXACTLY ONE of the two lists, never both:
-  * buskit_breakers ({"amp","poles"}): breakers drawn INSIDE the bus-kit box. There is normally ONE
-    60A/2P breaker PER Powerwall 3 inside the bus-kit (2 PW3 -> two {60,2} entries; 1 PW3 -> one
-    {60,2}). These small per-PW3 60A/2P breakers are EASY TO MISS — look for them specifically.
-  * csr_breakers ([amp]): a MAIN breaker landing into the gateway from OUTSIDE the bus-kit (the
-    line/right side), e.g. a 200A/2P service main. Record amperage only, e.g. [200]. This is the CSR.
-  * A 200A (or any) MAIN is a CSR, NOT a bus-kit breaker — do not also list it under buskit_breakers.
-  * Do NOT classify the EXISTING house-panel main (e.g. "(E) MAIN BREAKER TO HOUSE 200A/2P") as a
-    gateway breaker at all — it belongs in NEITHER list.
-  EXAMPLE — a 2-PW3 gateway fed by a 200A service main:
-    "buskit_breakers": [{"amp": 60, "poles": 2}, {"amp": 60, "poles": 2}], "csr_breakers": [200]
+  * buskit_breakers ({"amp","poles"}): EVERY breaker SYMBOL drawn INSIDE the bus-kit box — enumerate
+    them ALL from the diagram (not a fixed number, not derived from the Powerwall count). There is
+    normally one 60A/2P per Powerwall 3, AND there may be ADDITIONAL breakers of other ratings
+    (e.g. a 100A/2P). Read each one's amp+poles off its label and list every one. The 100A/2P, if
+    drawn in the bus-kit, MUST be captured here. Example — two 60A/2P plus one 100A/2P inside the box:
+      [{"amp":60,"poles":2},{"amp":60,"poles":2},{"amp":100,"poles":2}].
+  * csr_breakers ([amp]): ONLY a real breaker SYMBOL drawn OUTSIDE the bus-kit box, landing into the
+    gateway from the line/right side. Record amperage only. If no such external breaker is drawn,
+    csr_breakers = [].
+    -- The gateway's ENCLOSURE rating is NOT a breaker. A label like "TESLA GATEWAY 3, 200A, NEMA 3R,
+       240/120V" is the gateway's bus/enclosure amperage — do NOT emit it as a csr_breaker.
+    -- The distinction is POSITIONAL, not by rating: a CSR's amperage OFTEN EQUALS the gateway rating
+       (a 200A CSR on a 200A gateway is normal), so do NOT disqualify a breaker just because its
+       rating matches the gateway. A breaker SYMBOL outside the bus-kit = CSR; the enclosure's printed
+       rating label = not a breaker.
+  * The EXISTING house-panel main (e.g. "(E) MAIN BREAKER TO HOUSE 200A/2P") is NEITHER — exclude it.
 - one_line_text: a FULL verbatim transcription of the one-line's text labels, callouts, and equipment
   notes — INCLUDING the "EXPANSION HARNESS P/N 1875157-..." callout and supply-side tap SKUs
   ("K4977", "NSI IT-3/0", "IT-250"). Do NOT summarize or drop callouts. Up to ~3000 characters.
