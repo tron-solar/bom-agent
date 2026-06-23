@@ -90,6 +90,10 @@ class PlansetData:
     # new-flag and equipment SKU + gateway_count/backup_switch/inverter_sku/remote_meter_count.
     electrical: dict = field(default_factory=dict)
 
+    # Structured HARD/SOFT flags raised during extraction (e.g. equipment_count_mismatch). The
+    # orchestrator merges these straight into FLAGS_FOR_HUMAN_REVIEW.
+    extraction_flags: list = field(default_factory=list)
+
 
 class PlansetExtractor:
     """
@@ -297,6 +301,43 @@ class PlansetExtractor:
                 f"Raw response (first 1000 chars): {(raw or '')[:1000]!r}"
             ) from e
 
+    def _page_text(self, pdf_path: str, page_index: Optional[int]) -> str:
+        """Raw text layer of one page (for the deterministic equipment-block parse). '' if unavailable."""
+        if page_index is None:
+            return ""
+        doc = fitz.open(pdf_path)
+        try:
+            return doc[page_index].get_text() or ""
+        except Exception:  # noqa: BLE001
+            return ""
+        finally:
+            doc.close()
+
+    @staticmethod
+    def _parse_equipment_text(text: str) -> dict:
+        """Parse the PROJECT-DESCRIPTION / equipment text block (PV-5 and PV-3 print it as plain text):
+            61 SIRIUS ELNSM54M-HC-N 450W MONO MODULES
+            21 TESLA: RSD MCI-2
+            02 TESLA POWERWALL 3 (1707000-XX-Y)
+            01 TESLA POWERWALL 3 EXPANSION UNIT (1807000-xx-y)
+        Returns {'pw3','expansion','mci2','modules'} as ints (None if a line isn't present). The
+        leading integer on each line is the authoritative count — it's typed text, not a schematic."""
+        out = {"pw3": None, "expansion": None, "mci2": None, "modules": None}
+        for line in (text or "").splitlines():
+            m = re.match(r"\s*0*(\d+)\s+(.+)", line)
+            if not m:
+                continue
+            n, desc = int(m.group(1)), m.group(2).upper()
+            if "EXPANSION" in desc or "1807000" in desc:
+                out["expansion"] = n
+            elif "POWERWALL 3" in desc or "1707000" in desc:
+                out["pw3"] = n
+            elif "MCI-2" in desc or "MCI" in desc:
+                out["mci2"] = n
+            elif "MODULE" in desc:
+                out["modules"] = n
+        return out
+
     async def extract(self, pdf_path: str, coperniq_project: Optional[dict] = None,
                       master_note_form: Optional[dict] = None) -> PlansetData:
         """
@@ -308,6 +349,7 @@ class PlansetExtractor:
         get_form(form_id). This form (NOT project.custom) is where stack/wall wording actually lives.
         """
         warnings = []
+        extraction_flags: list = []
 
         # --- Step 1: Extract cover sheet (PV-1, always page 0) ---
         cover_b64 = self._pdf_page_to_base64(pdf_path, 0, label="PV-1_cover")
@@ -351,6 +393,35 @@ class PlansetExtractor:
             pv31_b64 = self._pdf_page_to_base64(pdf_path, pv31_page, label="PV-3.1")
             string_data = await self._extract_string_map(pv31_b64)
 
+        # --- Step 3.5: Reconcile the Powerwall-3 count across THREE sources (priority order) ---
+        # 1 PRIMARY  : the PV-5 project-description / equipment TEXT block ("02 TESLA POWERWALL 3")
+        # 2 SECONDARY: PW3 blocks drawn on the PV-5 one-line (Vision) — cross-check only
+        # 3 TERTIARY : the PV-3 equipment/BOM table text
+        # Deliver source 1; if the available sources disagree, HARD-flag (never silently pick one).
+        src1 = self._parse_equipment_text(self._page_text(pdf_path, pv5_page)).get("pw3")  # PV-5 text
+        src2 = electrical_data.get("pw3_drawn_count")                                       # drawn blocks
+        src3 = self._parse_equipment_text(self._page_text(pdf_path, pv3_page)).get("pw3")  # PV-3 table
+        sources = {"pv5_text": src1, "drawn_blocks": src2, "pv3_table": src3}
+        present = [v for v in sources.values() if v is not None]
+        # Deliver in priority order; fall back to the cover's battery_quantity if no text source.
+        resolved_pw3 = next((v for v in (src1, src3, src2) if v is not None), None)
+        if resolved_pw3 is None:
+            resolved_pw3 = cover_data.get("battery_quantity")
+        if present and len(set(present)) > 1:
+            extraction_flags.append({
+                "level": "HARD", "item": "equipment_count_mismatch",
+                "msg": (f"PW3 count differs across sources {sources}; delivered {resolved_pw3} "
+                        f"(PV-5 equipment text is authoritative). A disagreement means a block was "
+                        f"misread — verify the Powerwall count on PV-1/PV-5/PV-3 before ordering.")})
+        # Normalize the delivered count into pw3_skus (drives row 52 + per-PW3 bus-kit breakers) and
+        # record the three source values for the confidence report.
+        if isinstance(resolved_pw3, int) and resolved_pw3 >= 0:
+            read = electrical_data.get("pw3_skus") or []
+            sku = read[0] if read else "1707000"
+            electrical_data["pw3_skus"] = [sku] * resolved_pw3
+        electrical_data["pw3_count"] = resolved_pw3
+        electrical_data["pw3_count_sources"] = sources
+
         # --- Step 4: Resolve expansion mount kit (plans -> master note -> default wall) ---
         plan_mount = string_data.get("plan_mount") or array_data.get("plan_mount")
         master_notes = None
@@ -371,8 +442,10 @@ class PlansetExtractor:
                             "defaulted to wall — fetch get_form(Master Note) and pass master_note_form")
 
         # --- Merge and return ---
-        return self._merge(cover_data, electrical_data, array_data,
-                           string_data, mount_kit, warnings)
+        planset = self._merge(cover_data, electrical_data, array_data,
+                              string_data, mount_kit, warnings)
+        planset.extraction_flags = extraction_flags
+        return planset
 
     async def _extract_string_map(self, image_b64: str) -> dict:
         """
@@ -493,6 +566,7 @@ Return ONLY valid JSON, no other text:
   "gateway_count": integer,
   "backup_switch": boolean,
   "pw3_skus": ["string"],
+  "pw3_drawn_count": integer,
   "inverter_sku": "string or null",
   "remote_meter_count": integer,
 
@@ -518,6 +592,8 @@ Rules — read the LABELS, not just the symbols:
 - gateway_count: number of Tesla Energy Gateway units drawn (usually 0 or 1).
 - backup_switch: true if a Tesla Backup Switch is drawn (Gateway and Backup Switch rarely coexist).
 - pw3_skus: one entry per Powerwall 3 unit drawn, using its 1707000-... SKU (EXCLUDE PW3 Expansion units).
+- pw3_drawn_count: how many PW3 BLOCKS you actually count drawn in the schematic (a cross-check on the
+  text-block count; report what you see even if it differs from the equipment list).
 - inverter_sku: a standalone Tesla inverter SKU if drawn, else null.
 - remote_meter_count: count of "TESLA REMOTE ENERGY METER" blocks, else 0.
 - GATEWAY BREAKER CLASSIFICATION — read carefully, this is error-prone. The Tesla Gateway has an

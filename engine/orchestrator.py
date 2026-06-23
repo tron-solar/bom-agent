@@ -126,12 +126,18 @@ def _build_blocks(planset, project: dict):
 
     if gateway_count:
         _run_block("ground_bar", flags, elec_rows, lambda: ee.ground_bar(gateway_count))  # row 22
-        buskit = [(int(b["amp"]), int(b["poles"]))
-                  for b in (elec.get("buskit_breakers") or []) if b.get("amp") and b.get("poles")]
+        pw3_count = len(pw3_skus) or battery_count
+        # One 60A/2P bus-kit breaker PER Powerwall 3, derived from the authoritative PW3 count (the
+        # per-PW3 breakers are easy to miss / mis-count in the schematic). Keep any OTHER bus-kit
+        # breakers Vision read (e.g. a non-60A/2P), and the gate then reconciles against the real count.
+        other_buskit = [(int(b["amp"]), int(b["poles"]))
+                        for b in (elec.get("buskit_breakers") or [])
+                        if b.get("amp") and b.get("poles")
+                        and not (int(b["amp"]) == 60 and int(b["poles"]) == 2)]
+        buskit = [(60, 2)] * pw3_count + other_buskit
         csr = [int(a) for a in (elec.get("csr_breakers") or []) if a]
         _run_block("tesla_gateway_breakers", flags, elec_rows,           # BR 98-110 / CSR 112-114
-                   lambda: re_eng.tesla_gateway_breakers(buskit, csr,
-                                                         battery_pw3_count=(len(pw3_skus) or battery_count)))
+                   lambda: re_eng.tesla_gateway_breakers(buskit, csr, battery_pw3_count=pw3_count))
 
     # Meter line + special-order P/N (rows 81-96): NEW meter only; unmapped P/N -> row 96 stamped B+C.
     _run_block("meter_socket", flags, elec_rows,
@@ -220,6 +226,9 @@ def build_bom(planset_pdf_path: str, coperniq_project_dict: dict) -> tuple[bytes
                          "list_project_forms/get_form), so expansion mount/stack resolution is "
                          "unavailable. Wire the form fetch to enable it."})
 
+    # 2a) Structured flags raised inside the extractor (e.g. equipment_count_mismatch).
+    flags.extend(getattr(planset, "extraction_flags", []) or [])
+
     # 2b) Surface extraction-time issues as FLAGS, not a buried warnings list. Anything that looks
     #     like a failure (import/parse/exception) is HARD — a swallowed error must never read as
     #     "ready for review"; benign notices (fallback page used, mount defaulted) are SOFT but visible.
@@ -271,6 +280,8 @@ def build_bom(planset_pdf_path: str, coperniq_project_dict: dict) -> tuple[bytes
             "new_msp_drawn": el.get("new_msp_drawn"),
             "msp_pn": el.get("msp_pn"),
             "one_line_text_present": bool(el.get("one_line_text")),
+            "pw3_count": el.get("pw3_count"),
+            "pw3_count_sources": el.get("pw3_count_sources"),
         },
     }
     return data, confidence
