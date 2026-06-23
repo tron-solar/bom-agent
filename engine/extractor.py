@@ -338,6 +338,15 @@ class PlansetExtractor:
                 out["modules"] = n
         return out
 
+    @staticmethod
+    def _extract_harness_code(text: str) -> Optional[str]:
+        """Find the Tesla expansion harness length code in free text. Matches '1875157-05-X',
+        '1875157 05', etc. (optional spaces/hyphens, case-insensitive). Returns '05'|'20'|'40' or None."""
+        if not text:
+            return None
+        m = re.search(r"1875157[\s\-]{0,3}(05|20|40)", str(text).upper())
+        return m.group(1) if m else None
+
     async def extract(self, pdf_path: str, coperniq_project: Optional[dict] = None,
                       master_note_form: Optional[dict] = None) -> PlansetData:
         """
@@ -453,6 +462,38 @@ class PlansetExtractor:
         if master_note_form is None and not plan_mount:
             warnings.append("expansion mount: no plan keyword and no Master Note form supplied; "
                             "defaulted to wall — fetch get_form(Master Note) and pass master_note_form")
+
+        # --- Step 4.1: Multi-source expansion HARNESS resolution (only when there is an expansion) ---
+        # 1 direct Vision harness_pn field; 2 regex over the FULL one-line text; 3 Master Note text.
+        # Deliver the first that yields a length code (05/20/40); conflict -> HARD; none -> leave it
+        # null so tesla_expansion raises expansion_harness_pn_missing (never guess).
+        if electrical_data.get("expansion_count"):
+            mn_text = ""
+            if isinstance(master_notes, dict):
+                mn_text = " ".join(str(master_notes.get(k, "") or "") for k in
+                                   ("design_notes", "additional_notes", "installation_notes",
+                                    "field_installation_notes"))
+            by_source = {
+                "direct_field": self._extract_harness_code(electrical_data.get("harness_pn") or ""),
+                "one_line_text": self._extract_harness_code(electrical_data.get("one_line_text") or ""),
+                "master_note": self._extract_harness_code(mn_text),
+            }
+            resolved = by_source["direct_field"] or by_source["one_line_text"] or by_source["master_note"]
+            if resolved:
+                src = next(k for k, v in by_source.items() if v == resolved)
+                electrical_data["harness_pn"] = f"1875157-{resolved}"
+                electrical_data["harness_source"] = src
+                if len({v for v in by_source.values() if v}) > 1:
+                    extraction_flags.append({
+                        "level": "HARD", "item": "harness_pn_conflict",
+                        "msg": f"Expansion harness P/N differs across sources {by_source}; delivered "
+                               f"1875157-{resolved} ({src}). Verify the EXPANSION HARNESS callout on PV-5."})
+                else:
+                    extraction_flags.append({
+                        "level": "NOTE", "item": "harness_pn_source",
+                        "msg": f"Expansion harness resolved to 1875157-{resolved} from {src}."})
+            else:
+                electrical_data["harness_source"] = None
 
         # --- Merge and return ---
         planset = self._merge(cover_data, electrical_data, array_data,
@@ -620,8 +661,10 @@ Rules — read the LABELS, not just the symbols:
 - remote_meter_count: count of "TESLA REMOTE ENERGY METER" blocks, else 0.
 - expansion_drawn_count: how many Powerwall 3 EXPANSION units (1807000) are drawn, else 0. (The
   equipment text block is the authoritative count; this is a cross-check.)
-- harness_pn: the EXACT expansion harness P/N drawn on the one-line (1875157-05 / -20 / -40), else null.
-  The suffix matters: -05 = stack harness, -20/-40 = wall. Transcribe it; do not infer from mount.
+- harness_pn: find the labeled EXPANSION HARNESS callout on the one-line — it reads
+  "EXPANSION HARNESS P/N 1875157-NN-X" (NN = length code 05, 20, or 40) and points at the line
+  BETWEEN the Powerwalls. Return the EXACT full P/N including the -NN- (e.g. "1875157-05-X"), else
+  null. The suffix matters (-05 = stack, -20/-40 = wall); transcribe it, never infer from the mount.
 - expansion_mount: "stack" or "wall" only if a mount keyword is written near the expansion unit, else null.
 - GATEWAY BREAKER CLASSIFICATION — read carefully, this is error-prone. The Tesla Gateway has an
   internal BUS-KIT enclosure. Put each breaker in EXACTLY ONE of the two lists, never both:
@@ -635,8 +678,9 @@ Rules — read the LABELS, not just the symbols:
     gateway breaker at all — it belongs in NEITHER list.
   EXAMPLE — a 2-PW3 gateway fed by a 200A service main:
     "buskit_breakers": [{"amp": 60, "poles": 2}, {"amp": 60, "poles": 2}], "csr_breakers": [200]
-- one_line_text: a verbatim transcription of the one-line's text labels/notes (so supply-side tap SKUs
-  like "K4977", "NSI IT-3/0", "IT-250" can be matched). Keep it under ~1500 characters.
+- one_line_text: a FULL verbatim transcription of the one-line's text labels, callouts, and equipment
+  notes — INCLUDING the "EXPANSION HARNESS P/N 1875157-..." callout and supply-side tap SKUs
+  ("K4977", "NSI IT-3/0", "IT-250"). Do NOT summarize or drop callouts. Up to ~3000 characters.
 - Use [] / 0 / false for absent items; null only for the string/number fields that say "or null"."""
 
         raw = await self._call_claude([image_b64], prompt)

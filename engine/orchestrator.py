@@ -304,7 +304,9 @@ def build_bom(planset_pdf_path: str, coperniq_project_dict: dict,
             "pw3_count_sources": el.get("pw3_count_sources"),
             "expansion_count": el.get("expansion_count"),
             "harness_pn": el.get("harness_pn"),
+            "harness_source": el.get("harness_source"),
             "expansion_mount": el.get("expansion_mount"),
+            "one_line_text": el.get("one_line_text"),
         },
     }
     return data, confidence
