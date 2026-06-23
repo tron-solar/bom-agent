@@ -74,8 +74,28 @@ def download_planset(client: CoperniqClient, project_id: str, customer_name: str
             "diagnostics": confirmed["diagnostics"]}
 
 
+# ---------- master note ----------
+def _fetch_master_note_form(client, project_id) -> dict | None:
+    """Find the project's 'Master Note' form and fetch its full field layout (formLayouts), which the
+    extractor uses for expansion mount/stack resolution. Returns None if there's no such form or the
+    forms API errors — never fatal; mount resolution just falls back to its default."""
+    try:
+        forms = client.list_project_forms(project_id) or []
+        mn = next((f for f in forms
+                   if str(f.get("name", "")).strip().lower() == "master note"), None)
+        if not mn:
+            log.info("no 'Master Note' form on project %s", project_id)
+            return None
+        return client.get_form(mn.get("id"))
+    except Exception:
+        log.warning("Master Note form fetch failed for %s; proceeding without it",
+                    project_id, exc_info=True)
+        return None
+
+
 # ---------- engine boundary ----------
-def run_engine(planset_pdf_path: str, project: ProjectContext) -> tuple[bytes, dict]:
+def run_engine(planset_pdf_path: str, project: ProjectContext,
+               master_note_form: dict | None = None) -> tuple[bytes, dict]:
     """INTEGRATION BOUNDARY — calls the validated BOM engine in engine/.
 
     Replace the import/call below with the engine project's orchestrator entry point. It must:
@@ -95,7 +115,8 @@ def run_engine(planset_pdf_path: str, project: ProjectContext) -> tuple[bytes, d
             "expose build_bom(planset_pdf_path, coperniq_project_dict) -> (xlsx_bytes, confidence_dict). "
             f"Import error: {e}"
         )
-    xlsx_bytes, confidence = build_bom(planset_pdf_path, project.raw)
+    xlsx_bytes, confidence = build_bom(planset_pdf_path, project.raw,
+                                       master_note_form=master_note_form)
     return xlsx_bytes, confidence
 
 
@@ -164,8 +185,12 @@ def process(project_id: str, task_key: str) -> PipelineResult:
         notify_failure(client, project_id, mention, f"planset download: {e}")
         return PipelineResult("failed", f"planset download failed: {e}")
 
+    # Fetch the project's "Master Note" form (drives expansion mount/stack resolution). Optional:
+    # absent form or a forms-API hiccup -> None, never fails the run.
+    master_note_form = _fetch_master_note_form(client, project_id)
+
     try:
-        xlsx_bytes, confidence = run_engine(planset_path, project)
+        xlsx_bytes, confidence = run_engine(planset_path, project, master_note_form)
         # record which planset was used + its revision in the confidence report
         confidence.setdefault("planset", {})
         confidence["planset"].update({"file_name": pdf["name"], "revision": pdf["revision"],

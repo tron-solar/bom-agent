@@ -24,7 +24,7 @@ import app.main as main
 from app.models import ProjectContext, Assignee
 
 
-def _fake_engine(planset_path, project):
+def _fake_engine(planset_path, project, master_note_form=None):
     wb = openpyxl.load_workbook(os.path.join("engine", "BOM_TEMPLATE.xlsx"))
     wb["Solar BOM"]["A5"] = 29
     b = io.BytesIO(); wb.save(b)

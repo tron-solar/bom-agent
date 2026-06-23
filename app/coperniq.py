@@ -85,6 +85,24 @@ class CoperniqClient:
             r.raise_for_status()
             return r.json()
 
+    def list_project_forms(self, project_id: str) -> list[dict]:
+        """All forms on a project (GET /v1/projects/{id}/forms). Confirmed live: returns a list."""
+        with httpx.Client(timeout=self.timeout) as c:
+            r = c.get(f"{self.base}/projects/{project_id}/forms",
+                      headers=self._headers(), params={"page": 1, "page_size": 100})
+            r.raise_for_status()
+            data = r.json()
+            return data if isinstance(data, list) else (
+                data.get("items") or data.get("data") or data.get("forms") or [])
+
+    def get_form(self, form_id: Any) -> dict:
+        """One form with its field layout (GET /v1/forms/{form_id}) — carries `formLayouts`, which the
+        extractor's master-note parser walks for stack/wall wording."""
+        with httpx.Client(timeout=self.timeout) as c:
+            r = c.get(f"{self.base}/forms/{form_id}", headers=self._headers())
+            r.raise_for_status()
+            return r.json()
+
     # ---------- WRITE ----------
     def create_project_file(self, project_id: str, url: str, name: str,
                             phase_instance_id: Optional[int] = None, is_archived: bool = False) -> dict:

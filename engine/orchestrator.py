@@ -201,8 +201,12 @@ def _normalize_flags(flags: list[dict]) -> list[dict]:
 
 
 # ---------- public entry point ----------
-def build_bom(planset_pdf_path: str, coperniq_project_dict: dict) -> tuple[bytes, dict]:
-    """Public entry point for the trigger service. Returns (xlsx_bytes, confidence_dict)."""
+def build_bom(planset_pdf_path: str, coperniq_project_dict: dict,
+              master_note_form: dict | None = None) -> tuple[bytes, dict]:
+    """Public entry point for the trigger service. Returns (xlsx_bytes, confidence_dict).
+
+    master_note_form: the project's "Master Note" form (app/pipeline fetches it via
+    list_project_forms -> get_form). Drives expansion mount/stack resolution; None if absent."""
     confidence: dict = {
         "project": {
             "id": coperniq_project_dict.get("id"),
@@ -213,18 +217,19 @@ def build_bom(planset_pdf_path: str, coperniq_project_dict: dict) -> tuple[bytes
         "FLAGS_FOR_HUMAN_REVIEW": [],
     }
 
-    # 1) EXTRACT (Claude Vision). master_note_form is None here: app/pipeline.py (untouched) does not
-    #    fetch the project's "Master Note" form, so mount/stack resolution is limited — flagged below.
-    planset = extract_planset(planset_pdf_path, coperniq_project_dict, master_note_form=None)
+    # 1) EXTRACT (Claude Vision). app/pipeline.py fetches the project's "Master Note" form and passes
+    #    it here so the extractor's mount/stack resolution can use it.
+    planset = extract_planset(planset_pdf_path, coperniq_project_dict, master_note_form=master_note_form)
 
     # 2) HEADER + BLOCKS
     zone, zone_flags = ee.warehouse_zone(coperniq_project_dict)
     solar_rows, elec_rows, solar_sp, elec_sp, flags = _build_blocks(planset, coperniq_project_dict)
     flags = list(zone_flags) + list(flags)
-    flags.append({"level": "NOTE", "item": "master_note_not_fetched",
-                  "msg": "Master Note form not fetched (app/pipeline.py does not call "
-                         "list_project_forms/get_form), so expansion mount/stack resolution is "
-                         "unavailable. Wire the form fetch to enable it."})
+    if master_note_form is None:
+        flags.append({"level": "NOTE", "item": "master_note_not_fetched",
+                      "msg": "No 'Master Note' form was available for this project, so expansion "
+                             "mount/stack resolution falls back to the default — verify if there are "
+                             "expansion units."})
 
     # 2a) Structured flags raised inside the extractor (e.g. equipment_count_mismatch).
     flags.extend(getattr(planset, "extraction_flags", []) or [])
