@@ -398,9 +398,11 @@ class PlansetExtractor:
         # 2 SECONDARY: PW3 blocks drawn on the PV-5 one-line (Vision) — cross-check only
         # 3 TERTIARY : the PV-3 equipment/BOM table text
         # Deliver source 1; if the available sources disagree, HARD-flag (never silently pick one).
-        src1 = self._parse_equipment_text(self._page_text(pdf_path, pv5_page)).get("pw3")  # PV-5 text
-        src2 = electrical_data.get("pw3_drawn_count")                                       # drawn blocks
-        src3 = self._parse_equipment_text(self._page_text(pdf_path, pv3_page)).get("pw3")  # PV-3 table
+        pv5_eq = self._parse_equipment_text(self._page_text(pdf_path, pv5_page))   # PV-5 text block
+        pv3_eq = self._parse_equipment_text(self._page_text(pdf_path, pv3_page))   # PV-3 table text
+        src1 = pv5_eq.get("pw3")                       # PV-5 text
+        src2 = electrical_data.get("pw3_drawn_count")  # drawn blocks
+        src3 = pv3_eq.get("pw3")                       # PV-3 table
         sources = {"pv5_text": src1, "drawn_blocks": src2, "pv3_table": src3}
         present = [v for v in sources.values() if v is not None]
         # Deliver in priority order; fall back to the cover's battery_quantity if no text source.
@@ -422,8 +424,17 @@ class PlansetExtractor:
         electrical_data["pw3_count"] = resolved_pw3
         electrical_data["pw3_count_sources"] = sources
 
+        # Expansion-unit count (PW3 Expansion, 1807000): PV-5 text -> PV-3 text -> drawn -> cover.
+        # None means "not stated anywhere" (distinct from an explicit 0); the orchestrator flags the
+        # None case for a battery system so the expansion block isn't silently omitted.
+        electrical_data["expansion_count"] = next(
+            (v for v in (pv5_eq.get("expansion"), pv3_eq.get("expansion"),
+                         electrical_data.get("expansion_drawn_count"),
+                         cover_data.get("expansion_quantity")) if v is not None), None)
+
         # --- Step 4: Resolve expansion mount kit (plans -> master note -> default wall) ---
-        plan_mount = string_data.get("plan_mount") or array_data.get("plan_mount")
+        plan_mount = (string_data.get("plan_mount") or array_data.get("plan_mount")
+                      or electrical_data.get("expansion_mount"))   # PV-5 Vision mount keyword
         master_notes = None
         if coperniq_project is not None or master_note_form is not None:
             try:
@@ -437,6 +448,8 @@ class PlansetExtractor:
             mount_kit = resolve_expansion_mount(plan_mount=plan_mount, master_notes=master_notes)
         except Exception:
             mount_kit = "wall"
+        # The RESOLVED mount (stack/wall) drives the orchestrator's tesla_expansion mount-kit row.
+        electrical_data["expansion_mount"] = mount_kit
         if master_note_form is None and not plan_mount:
             warnings.append("expansion mount: no plan keyword and no Master Note form supplied; "
                             "defaulted to wall — fetch get_form(Master Note) and pass master_note_form")
@@ -569,6 +582,9 @@ Return ONLY valid JSON, no other text:
   "pw3_drawn_count": integer,
   "inverter_sku": "string or null",
   "remote_meter_count": integer,
+  "expansion_drawn_count": integer,
+  "harness_pn": "string or null",
+  "expansion_mount": "stack or wall or null",
 
   "buskit_breakers": [ {"amp": integer, "poles": integer} ],
   "csr_breakers": [ integer ],
@@ -602,6 +618,11 @@ Rules — read the LABELS, not just the symbols:
   text-block count; report what you see even if it differs from the equipment list).
 - inverter_sku: a standalone Tesla inverter SKU if drawn, else null.
 - remote_meter_count: count of "TESLA REMOTE ENERGY METER" blocks, else 0.
+- expansion_drawn_count: how many Powerwall 3 EXPANSION units (1807000) are drawn, else 0. (The
+  equipment text block is the authoritative count; this is a cross-check.)
+- harness_pn: the EXACT expansion harness P/N drawn on the one-line (1875157-05 / -20 / -40), else null.
+  The suffix matters: -05 = stack harness, -20/-40 = wall. Transcribe it; do not infer from mount.
+- expansion_mount: "stack" or "wall" only if a mount keyword is written near the expansion unit, else null.
 - GATEWAY BREAKER CLASSIFICATION — read carefully, this is error-prone. The Tesla Gateway has an
   internal BUS-KIT enclosure. Put each breaker in EXACTLY ONE of the two lists, never both:
   * buskit_breakers ({"amp","poles"}): breakers drawn INSIDE the bus-kit box. There is normally ONE

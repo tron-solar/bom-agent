@@ -139,6 +139,21 @@ def _build_blocks(planset, project: dict):
         _run_block("tesla_gateway_breakers", flags, elec_rows,           # BR 98-110 / CSR 112-114
                    lambda: re_eng.tesla_gateway_breakers(buskit, csr, battery_pw3_count=pw3_count))
 
+    # Tesla PW3 Expansion (rows 59 unit / 63-65 harness by -05/-20/-40 / 61 stack or 62 wall kit).
+    # Mount was already resolved in the extractor (plan -> Master Note -> default wall).
+    exp_count = elec.get("expansion_count")
+    if exp_count and int(exp_count) > 0:
+        _run_block("tesla_expansion", flags, elec_rows,
+                   lambda: ee.tesla_expansion(int(exp_count), harness_pn=elec.get("harness_pn"),
+                                              mount=elec.get("expansion_mount")))
+    elif (pw3_skus or battery_count) and exp_count is None:
+        # Battery system, but the expansion count couldn't be read (not an explicit 0). Don't silently
+        # omit the expansion block — flag for review.
+        flags.append({"level": "SOFT", "item": "expansion_count_undetermined",
+                      "msg": "Battery system present but no PW3 Expansion-unit count could be read "
+                             "from the equipment text (not an explicit 0). If there is an expansion "
+                             "unit, its rows (59/61-65) are missing — verify PV-1/PV-5."})
+
     # Meter line + special-order P/N (rows 81-96): NEW meter only; unmapped P/N -> row 96 stamped B+C.
     _run_block("meter_socket", flags, elec_rows,
                lambda: ee.meter_socket(bool(elec.get("new_meter_drawn")), elec.get("meter_pn")), elec_special)
@@ -287,6 +302,9 @@ def build_bom(planset_pdf_path: str, coperniq_project_dict: dict,
             "one_line_text_present": bool(el.get("one_line_text")),
             "pw3_count": el.get("pw3_count"),
             "pw3_count_sources": el.get("pw3_count_sources"),
+            "expansion_count": el.get("expansion_count"),
+            "harness_pn": el.get("harness_pn"),
+            "expansion_mount": el.get("expansion_mount"),
         },
     }
     return data, confidence
