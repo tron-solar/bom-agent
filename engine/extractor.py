@@ -7,6 +7,7 @@ Part of the planset-extractor skill.
 """
 
 import os
+import re
 import ssl
 import json
 import base64
@@ -156,24 +157,74 @@ class PlansetExtractor:
         new_doc.close()
         return found
 
+    def _label_in_title_block(self, page, label: str) -> bool:
+        """True if `label` is the page's OWN sheet number — it appears as a standalone word in the
+        bottom-right title-block region. This is what distinguishes the real sheet from the cover's
+        table-of-contents (mid-left) and from in-note cross-references ('see PV-5')."""
+        rect = page.rect
+        w, h = rect.width, rect.height
+        if not w or not h:
+            return False
+        target = label.replace(" ", "").upper()
+        try:
+            words = page.get_text("words")  # (x0, y0, x1, y1, word, block, line, word_no)
+        except Exception:  # noqa: BLE001
+            return False
+        for x0, y0, x1, y1, word, *_ in words:
+            if x0 >= 0.60 * w and y0 >= 0.78 * h:           # bottom-right region
+                if word.replace(" ", "").upper() == target:  # EXACT word so 'PV-3' != 'PV-3.1'
+                    return True
+        return False
+
     def _find_page_by_label(self, pdf_path: str, label: str) -> Optional[int]:
-        """
-        Find page number by searching for a label (e.g. 'PV-5') in page text.
-        Returns 0-indexed page number or None if not found.
+        """Resolve a sheet label (e.g. 'PV-5') to its page index.
+
+        Anchors on the page's OWN title-block sheet number (bottom-right) so the cover's
+        table-of-contents and in-note cross-references don't win. Falls back to 'fewest distinct
+        PV-N labels, tie toward the later page' only when no title-block match exists. Returns the
+        page index, or None if it CANNOT confidently resolve to exactly one page — the caller must
+        HARD-flag and skip, never silently use page 0.
         """
         doc = fitz.open(pdf_path)
+        title_hits: list[int] = []
+        text_hits: list[tuple[int, int]] = []   # (distinct PV-N count on the page, page index)
         for i, page in enumerate(doc):
             text = page.get_text()
-            if label in text:
-                pos = text.find(label)
-                snippet = " ".join(text[max(0, pos - 30):pos + 40].split())
-                doc.close()
-                log.info("find_page_by_label(%r) -> page index %d (matched on: %r)", label, i, snippet)
-                self._dbg(f"[{label}] resolved to PAGE INDEX {i}  (matched text: {snippet!r})")
-                return i
+            if label not in text:
+                continue
+            text_hits.append((len(set(re.findall(r"PV-\d+(?:\.\d+)?", text))), i))
+            if self._label_in_title_block(page, label):
+                title_hits.append(i)
         doc.close()
-        log.warning("find_page_by_label(%r) -> NOT FOUND; caller will use a fallback page", label)
-        self._dbg(f"[{label}] NOT FOUND by label — caller falls back to a fixed page index")
+
+        # 1) Title-block anchor — the reliable discriminator.
+        if len(title_hits) == 1:
+            i = title_hits[0]
+            log.info("find_page_by_label(%r) -> page %d via title-block sheet number", label, i)
+            self._dbg(f"[{label}] resolved to PAGE INDEX {i} via TITLE-BLOCK sheet number")
+            return i
+        if len(title_hits) > 1:
+            log.warning("find_page_by_label(%r) -> title-block on multiple pages %s; AMBIGUOUS",
+                        label, title_hits)
+            self._dbg(f"[{label}] UNRESOLVED: title-block sheet number found on multiple pages {title_hits}")
+            return None
+
+        # 2) Fallback: the cover/TOC lists many PV-N labels; a real sheet references few. Pick the
+        #    page with the fewest, tie toward the later page; accept only if it's clearly non-TOC.
+        if text_hits:
+            text_hits.sort(key=lambda t: (t[0], -t[1]))
+            distinct, i = text_hits[0]
+            if distinct <= 3:
+                log.info("find_page_by_label(%r) -> page %d via fallback (distinct PV-N=%d)", label, i, distinct)
+                self._dbg(f"[{label}] resolved to PAGE INDEX {i} via FALLBACK (fewest PV-N labels={distinct})")
+                return i
+            log.warning("find_page_by_label(%r) -> only TOC-like pages (min distinct PV-N=%d); UNRESOLVED",
+                        label, distinct)
+            self._dbg(f"[{label}] UNRESOLVED: only table-of-contents-like pages contain it (min PV-N={distinct})")
+            return None
+
+        log.warning("find_page_by_label(%r) -> NOT FOUND in any page text", label)
+        self._dbg(f"[{label}] NOT FOUND in any page text")
         return None
 
     async def _call_claude(self, images_b64: list, prompt: str) -> str:
@@ -257,31 +308,43 @@ class PlansetExtractor:
         cover_b64 = self._pdf_page_to_base64(pdf_path, 0, label="PV-1_cover")
         cover_data = await self._extract_cover_sheet(cover_b64)
 
-        # --- Step 2: Extract three-line diagram (PV-5) ---
+        module_wattage = cover_data.get("module_wattage", 400)
+
+        # --- Step 2: Extract three-line diagram (PV-5) — HARD-fail (no page-0 fallback) if unresolved ---
         pv5_page = self._find_page_by_label(pdf_path, "PV-5")
         if pv5_page is None:
-            pv5_page = 4
-            warnings.append("PV-5 page not found by label; using fallback page 4")
-        pv5_b64 = self._pdf_page_to_base64(pdf_path, pv5_page, label="PV-5")
-        electrical_data = await self._extract_three_line(pv5_b64)
+            warnings.append("page selection failed: PV-5 — could not confidently identify the "
+                            "electrical one-line sheet; PV-5 data NOT extracted (no fallback page).")
+            electrical_data = {}
+        else:
+            pv5_b64 = self._pdf_page_to_base64(pdf_path, pv5_page, label="PV-5")
+            electrical_data = await self._extract_three_line(pv5_b64)
 
-        # --- Step 3: Extract roof plan (PV-3) ---
+        # --- Step 3: Extract roof plan (PV-3) — same HARD-fail policy ---
         pv3_page = self._find_page_by_label(pdf_path, "PV-3")
         if pv3_page is None:
-            pv3_page = 2
-            warnings.append("PV-3 page not found by label; using fallback page 2")
-        pv3_b64 = self._pdf_page_to_base64(pdf_path, pv3_page, label="PV-3")
-        module_wattage = cover_data.get("module_wattage", 400)
-        array_data = await self._extract_roof_plan(pv3_b64, module_wattage)
+            warnings.append("page selection failed: PV-3 — could not confidently identify the "
+                            "roof-plan sheet; PV-3 array data NOT extracted (no fallback page).")
+            array_data = {}
+        else:
+            pv3_b64 = self._pdf_page_to_base64(pdf_path, pv3_page, label="PV-3")
+            array_data = await self._extract_roof_plan(pv3_b64, module_wattage)
 
         # --- Step 3.1: Extract string map (PV-3.1) — strings-per-plane by dashed-line color ---
         pv31_page = self._find_page_by_label(pdf_path, "PV-3.1")
-        if pv31_page is None:
-            # some plansets put the string map on PV-3 itself
+        if pv31_page is None and pv3_page is not None:
+            # DOCUMENTED fallback (NOT page 0): some plansets fold the string map into PV-3. Reuse the
+            # already-resolved PV-3 page and NOTE it — visible, not silent.
             pv31_page = pv3_page
-            warnings.append("PV-3.1 page not found by label; using PV-3 page for string map")
-        pv31_b64 = self._pdf_page_to_base64(pdf_path, pv31_page, label="PV-3.1")
-        string_data = await self._extract_string_map(pv31_b64)
+            warnings.append("PV-3.1 not a separate sheet; reading the string map from the resolved "
+                            "PV-3 page (affects J-box counts; verify).")
+        if pv31_page is None:
+            warnings.append("page selection failed: PV-3.1 — string map sheet not identified and no "
+                            "PV-3 page to fall back to; strings-per-plane NOT extracted.")
+            string_data = {}
+        else:
+            pv31_b64 = self._pdf_page_to_base64(pdf_path, pv31_page, label="PV-3.1")
+            string_data = await self._extract_string_map(pv31_b64)
 
         # --- Step 4: Resolve expansion mount kit (plans -> master note -> default wall) ---
         plan_mount = string_data.get("plan_mount") or array_data.get("plan_mount")
