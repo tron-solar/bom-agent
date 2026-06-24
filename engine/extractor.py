@@ -598,72 +598,177 @@ class PlansetExtractor:
                 rows.append(r)
         return rows
 
-    async def _extract_racking(self, pdf_path: str, module_count, has_enphase: bool) -> dict:
-        """Read the planset racking BOM table (Solar rows 33-90 source). Text layer where present
-        (roof inline table), Vision fallback for rasterized PV-3.x BOM sheets. Returns the racking
-        dict consumed by the orchestrator's racking block; format='absent' when nothing is found."""
-        out = {"format": "absent", "system_type": None, "attachment_type": None,
-               "module_count": module_count, "has_enphase": bool(has_enphase),
-               "roof": None, "ground_bom_table": None, "source": None,
-               "raw_rows": None, "unresolved": []}
+    def _detect_mount_type(self, pdf_path: str, pv3_page: Optional[int], cover_blob: str = "") -> str:
+        """roof | ground. Keyed on the PV-3 sheet NAME (the authoritative signal): roof plansets title
+        PV-3 'ROOF PLAN AND MODULES'; ground plansets 'GROUND PLAN AND MODULES'. Cover scope text is a
+        backup. Default 'roof' (the common case) if nothing is conclusive."""
+        t = (self._page_text(pdf_path, pv3_page) or "").upper() if pv3_page is not None else ""
+        if "GROUND PLAN" in t or "GROUND MOUNT" in t:
+            return "ground"
+        if "ROOF PLAN" in t:
+            return "roof"
+        c = (cover_blob or "").upper()
+        if "GROUND MOUNT" in c or "GROUND-MOUNT" in c or "GROUND MOUNTED" in c:
+            return "ground"
+        return "roof"
+
+    @staticmethod
+    def _has_bom_marker(text: str) -> bool:
+        """True if a page carries the racking BOM table: the embedded-text header (EQUIPMENT+QTY+
+        DESCRIPTION) OR the 'BILL OF MATERIAL' sheet label (present in a flattened sheet's title block)."""
+        U = (text or "").upper()
+        if "EQUIPMENT" in U and "QTY" in U and "DESCRIPTION" in U:
+            return True
+        return "BILL OF MATERIAL" in U
+
+    def _bom_image_pages(self, pdf_path: str, anchor: int) -> list:
+        """The flattened BOM sheet(s): the anchor page plus any sibling PV-3.x sheets that are a
+        'BILL OF MATERIAL' title block over a big embedded image (a two-array GM spans PV-3.1+PV-3.2)."""
+        out = []
         doc = fitz.open(pdf_path)
         try:
-            pages = []
             for i in range(doc.page_count):
-                full = doc[i].get_text() or ""
+                full = (doc[i].get_text() or "").upper()
                 wc = len(doc[i].get_text("words"))
                 big = sum(1 for im in doc[i].get_images(full=True) if im[2] > 400 and im[3] > 400)
-                pages.append((i, full, full.upper(), wc, big))
+                if "BILL OF MATERIAL" in full and wc < 140 and big >= 1:
+                    out.append(i)
         finally:
             doc.close()
+        if anchor is not None and anchor not in out:
+            out = [anchor] + out
+        return out or ([anchor] if anchor is not None else [])
 
-        # 1) INLINE TEXT table (roof or ground): only accept a page that actually PARSES into a
-        # substantive table. (A sheet-INDEX "BILL OF MATERIAL" reference on the cover, or stray
-        # racking words in the general notes, must NOT be mistaken for the table itself.)
-        for i, full, U, wc, big in pages:
-            if "BILL OF MATERIAL" not in U or wc <= 150:
+    def _content_search_bom_page(self, pdf_path: str, mount_type: str) -> Optional[int]:
+        """Fallback when the predicted page lacks a BOM table: scan PV-3/PV-3.x for a page that
+        actually IS the BOM table (parseable text table, or a flattened BOM sheet). Excludes the cover
+        (a sheet-INDEX 'BILL OF MATERIAL' reference does not parse into a table)."""
+        doc = fitz.open(pdf_path)
+        try:
+            for i in range(doc.page_count):
+                full = doc[i].get_text() or ""
+                U = full.upper()
+                wc = len(doc[i].get_text("words"))
+                big = sum(1 for im in doc[i].get_images(full=True) if im[2] > 400 and im[3] > 400)
+                if mount_type == "ground":
+                    if len(self._parse_ground_racking_text(full)) >= 3 or (
+                            "BILL OF MATERIAL" in U and wc < 140 and big >= 1):
+                        return i
+                else:
+                    roof, _ = self._parse_roof_racking_text(full)
+                    if sum(1 for v in roof.values() if v is not None) >= 3:
+                        return i
+        finally:
+            doc.close()
+        return None
+
+    def _build_gm_table_from_rows(self, rows: list):
+        """Normalize Vision/text BOM rows -> {gm_key: summed_qty} for k2_ground_mount; unrecognized
+        lines (with a qty) are returned for flagging — never silently dropped or guessed."""
+        table, unresolved = {}, []
+        for r in (rows or []):
+            key = self._normalize_gm_key(r.get("part_number"), r.get("description"))
+            qty = r.get("quantity")
+            if key and isinstance(qty, int):
+                table[key] = table.get(key, 0) + qty
+            elif not key and qty:
+                unresolved.append(f"{r.get('part_number') or ''} {r.get('description') or ''} (qty {qty})")
+        return table, unresolved
+
+    @staticmethod
+    def _roof_fields_from_rows(rows: list):
+        """Map Vision BOM rows (description+quantity) to roof racking fields — the roof analog used when
+        a roof BOM sheet is flattened (text layer empty)."""
+        out = {"attachments": None, "rails": None, "splice": None,
+               "mid_clamps": None, "end_clamps": None, "modules": None}
+        for r in (rows or []):
+            U = (r.get("description") or "").upper()
+            qty = r.get("quantity")
+            if not isinstance(qty, int):
                 continue
-            system, at = self._classify_attachment(full)
-            if system == "ground":
-                table = self._parse_ground_racking_text(full)
-                if len(table) >= 3:
-                    out.update(format="ground_text", system_type="ground", attachment_type=at,
-                               source=f"page {i} (text layer)", ground_bom_table=table)
-                    return out
-            else:
-                roof, triples = self._parse_roof_racking_text(full)
-                if sum(1 for v in roof.values() if v is not None) >= 3:
-                    out.update(format="roof_text", system_type=system, attachment_type=at,
-                               source=f"page {i} (text layer)", roof=roof, raw_rows=triples)
-                    return out
+            if "END CLAMP" in U:
+                out["end_clamps"] = qty
+            elif "MID" in U or "MODULE CLAMP" in U:
+                out["mid_clamps"] = qty
+            elif "ATTACHMENT" in U or "MULTIMOUNT" in U:
+                out["attachments"] = qty
+            elif "RAIL" in U or "CROSSRAIL" in U:
+                out["rails"] = qty
+            elif "SPLICE" in U:
+                out["splice"] = qty
+        return out
 
-        # 2) FLATTENED-IMAGE BOM sheets ('BILL OF MATERIAL' sheet, title-block-only text + big images).
-        img_pages = [i for i, full, U, wc, big in pages
-                     if "BILL OF MATERIAL" in U and wc < 140 and big >= 1]
-        if img_pages:
-            rows = await self._vision_read_bom_table(pdf_path, img_pages)
-            blob = " ".join(f"{r.get('part_number') or ''} {r.get('description') or ''}" for r in rows)
-            system, at = self._classify_attachment(blob)
-            out["source"] = f"pages {img_pages} (flattened image — Vision)"
-            out["system_type"], out["attachment_type"] = system, at
-            out["raw_rows"] = rows
-            if system == "ground":
-                out["format"] = "ground_image_vision"
-                table = {}
-                for r in rows:
-                    key = self._normalize_gm_key(r.get("part_number"), r.get("description"))
-                    qty = r.get("quantity")
-                    if key and isinstance(qty, int):
-                        table[key] = table.get(key, 0) + qty
-                    elif not key and qty:
-                        out["unresolved"].append(f"{r.get('part_number') or ''} {r.get('description') or ''} (qty {qty})")
-                out["ground_bom_table"] = table
-            else:
-                out["format"] = "roof_image_vision"
-                out["unresolved"].append("roof racking BOM is a flattened image; roof image parsing not "
-                                         "yet implemented — populate roof racking manually.")
+    async def _extract_racking(self, pdf_path: str, module_count, has_enphase: bool,
+                               mount_type: str, pv3_page: Optional[int],
+                               pv31_page: Optional[int]) -> dict:
+        """Read the planset racking BOM table (Solar rows 33-90), PREDICT-THEN-VERIFY by mount type:
+
+          roof   -> BOM table is on PV-3   ('ROOF PLAN AND MODULES'); stringing on PV-3.1.
+          ground -> BOM table is on PV-3.1 ('BILL OF MATERIAL', a flattened K2 quote export);
+                    stringing on PV-3.
+
+        The expected page is located via _find_page_by_label (never a fixed index), then VERIFIED to
+        contain a BOM table. If it doesn't, fall back to a content search across PV-3/PV-3.x; if still
+        not found, format='bom_table_not_found' (orchestrator HARD-flags). Text vs Vision is decided by
+        whether the resolved page actually has a text layer — prefer text, fall back to Vision — so a
+        roof planset exported as raster, or a GM export that carries text, is still handled."""
+        out = {"format": "absent", "system_type": mount_type, "mount_type": mount_type,
+               "attachment_type": None, "module_count": module_count, "has_enphase": bool(has_enphase),
+               "roof": None, "ground_bom_table": None, "source": None, "bom_page": None,
+               "string_page": (pv3_page if mount_type == "ground" else pv31_page),
+               "raw_rows": None, "unresolved": []}
+
+        predicted = pv31_page if mount_type == "ground" else pv3_page
+        predicted_label = "PV-3.1" if mount_type == "ground" else "PV-3"
+
+        # locate + verify the BOM page (predicted-by-mount-type, then content-search fallback)
+        bom_page, source = None, None
+        if predicted is not None and self._has_bom_marker(self._page_text(pdf_path, predicted)):
+            bom_page = predicted
+            source = f"{predicted_label} (page {predicted}, predicted by {mount_type} mount, verified)"
+        else:
+            found = self._content_search_bom_page(pdf_path, mount_type)
+            if found is not None:
+                bom_page = found
+                source = (f"page {found} (content-search fallback — predicted {predicted_label} "
+                          f"lacked a BOM table)")
+        if bom_page is None:
+            out["format"] = "bom_table_not_found"
+            out["unresolved"].append(
+                f"No racking BOM table found: predicted {predicted_label} for a {mount_type} mount had "
+                f"no EQUIPMENT/QTY/DESCRIPTION header or 'BILL OF MATERIAL', and no PV-3/PV-3.x page did.")
             return out
+        out["bom_page"] = bom_page
 
+        full = self._page_text(pdf_path, bom_page)
+
+        if mount_type == "ground":
+            # prefer text if this page happens to carry a parseable GM table; else Vision the raster.
+            table = self._parse_ground_racking_text(full)
+            if len(table) >= 3:
+                out.update(format="ground_text", attachment_type="K2_GROUND",
+                           ground_bom_table=table, source=f"{source} [text layer]")
+            else:
+                img_pages = self._bom_image_pages(pdf_path, bom_page)
+                rows = await self._vision_read_bom_table(pdf_path, img_pages)
+                tbl, unresolved = self._build_gm_table_from_rows(rows)
+                out.update(format="ground_image_vision", attachment_type="K2_GROUND",
+                           ground_bom_table=tbl, raw_rows=rows,
+                           source=f"{source} [flattened raster -> Vision, pages {img_pages}]")
+                out["unresolved"] += unresolved
+        else:
+            roof, triples = self._parse_roof_racking_text(full)
+            if sum(1 for v in roof.values() if v is not None) >= 3:
+                _, at = self._classify_attachment(full)
+                out.update(format="roof_text", attachment_type=at or "K2_SHINGLE",
+                           roof=roof, raw_rows=triples, source=f"{source} [text layer]")
+            else:
+                rows = await self._vision_read_bom_table(pdf_path, [bom_page])
+                _, at = self._classify_attachment(
+                    " ".join((r.get("description") or "") for r in rows))
+                out.update(format="roof_image_vision", attachment_type=at or "K2_SHINGLE",
+                           roof=self._roof_fields_from_rows(rows), raw_rows=rows,
+                           source=f"{source} [text layer empty -> Vision]")
         return out
 
     def _extract_electrical_from_text(self, pdf_path: str, page_index: Optional[int]) -> dict:
@@ -828,21 +933,28 @@ class PlansetExtractor:
             pv3_b64 = self._pdf_page_to_base64(pdf_path, pv3_page, label="PV-3")
             array_data = await self._extract_roof_plan(pv3_b64, module_wattage)
 
-        # --- Step 3.1: Extract string map (PV-3.1) — strings-per-plane by dashed-line color ---
+        # --- Mount type (roof | ground): keyed on the PV-3 sheet name. Sets the page-routing rule for
+        # the racking BOM table AND the stringing read (they live on OPPOSITE sheets per mount type):
+        #   roof   -> racking BOM on PV-3 (text);   stringing on PV-3.1
+        #   ground -> racking BOM on PV-3.1 (raster); stringing on PV-3 ('GROUND PLAN AND MODULES')
         pv31_page = self._find_page_by_label(pdf_path, "PV-3.1")
-        if pv31_page is None and pv3_page is not None:
-            # DOCUMENTED fallback (NOT page 0): some plansets fold the string map into PV-3. Reuse the
-            # already-resolved PV-3 page and NOTE it — visible, not silent.
-            pv31_page = pv3_page
-            warnings.append("PV-3.1 not a separate sheet; reading the string map from the resolved "
-                            "PV-3 page (affects J-box counts; verify).")
-        if pv31_page is None:
-            warnings.append("page selection failed: PV-3.1 — string map sheet not identified and no "
-                            "PV-3 page to fall back to; strings-per-plane NOT extracted.")
+        mount_type = self._detect_mount_type(pdf_path, pv3_page, self._page_text(pdf_path, 0))
+
+        # --- Step 3.1: Extract string map — routed by mount type to the stringing sheet ---
+        if mount_type == "ground":
+            string_page = pv3_page          # ground plan carries the stringing; PV-3.1 is the BOM
+        else:
+            string_page = pv31_page if pv31_page is not None else pv3_page
+            if pv31_page is None and pv3_page is not None:
+                warnings.append("PV-3.1 not a separate sheet; reading the string map from the resolved "
+                                "PV-3 page (affects J-box counts; verify).")
+        if string_page is None:
+            warnings.append("page selection failed: stringing sheet not identified; strings-per-plane "
+                            "NOT extracted.")
             string_data = {}
         else:
-            pv31_b64 = self._pdf_page_to_base64(pdf_path, pv31_page, label="PV-3.1")
-            string_data = await self._extract_string_map(pv31_b64)
+            string_b64 = self._pdf_page_to_base64(pdf_path, string_page, label="string_map")
+            string_data = await self._extract_string_map(string_b64)
 
         # --- Step 3.5: Reconcile the Powerwall-3 count across THREE sources (priority order) ---
         # 1 PRIMARY  : the PV-5 project-description / equipment TEXT block ("02 TESLA POWERWALL 3")
@@ -1002,7 +1114,8 @@ class PlansetExtractor:
         has_enphase = "ENPHASE" in en_blob or "IQ8" in en_blob
         module_count = cover_data.get("module_quantity") or 0
         try:
-            racking = await self._extract_racking(pdf_path, module_count, has_enphase)
+            racking = await self._extract_racking(pdf_path, module_count, has_enphase,
+                                                  mount_type, pv3_page, pv31_page)
         except Exception as e:  # noqa: BLE001 — never fail the whole run on the racking read
             racking = {"format": "absent", "unresolved": [f"racking extraction error: {e}"]}
             warnings.append(f"racking table extraction failed: {e}")

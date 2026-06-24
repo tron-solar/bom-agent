@@ -198,6 +198,12 @@ def _racking_block(planset):
     overrides: dict[int, tuple] = {}
     flags: list = []
     fmt = rk.get("format")
+    if fmt == "bom_table_not_found":
+        flags.append({"level": "HARD", "item": "racking_bom_table_not_found",
+                      "msg": f"Racking BOM table not found. {('; '.join(rk.get('unresolved') or []))} "
+                             f"Build Solar racking rows 33-90 by hand — the stringing page was NOT read "
+                             f"as the BOM."})
+        return rows, flags, overrides
     if not rk or fmt in (None, "absent"):
         flags.append({"level": "HARD", "item": "racking_not_read",
                       "msg": "Racking BOM table could not be read from the planset (no PV-3 text table "
