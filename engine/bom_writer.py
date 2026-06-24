@@ -41,8 +41,14 @@ def _stamp_special_orders(ws, special_order):
     the SKU cell (col B) and the DESCRIPTION cell (col C) with the stamped text (user, Meyer #877571),
     so the placeholder never survives into the delivered BOM and the line shows the SKU in column B."""
     for row, text in (special_order or {}).items():
-        ws.cell(int(row), SKU_COL).value = str(text)
-        ws.cell(int(row), DESC_COL).value = str(text)
+        # value is either a single string (meter/MSP P/N -> same text in B and C) or a (B_text, C_text)
+        # tuple (e.g. k2_ground_mount's row-84 Pipe Coupling new-SKU override -> distinct B/C).
+        if isinstance(text, (tuple, list)) and len(text) == 2:
+            b_text, c_text = text
+        else:
+            b_text = c_text = text
+        ws.cell(int(row), SKU_COL).value = str(b_text)
+        ws.cell(int(row), DESC_COL).value = str(c_text)
 
 
 def write_bom(template_path, out_path, *, customer_name, warehouse_zone, customer_address,

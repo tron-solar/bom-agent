@@ -174,10 +174,102 @@ def _build_blocks(planset, project: dict):
                                  "Backup Switch — implausible for an ESS. The PV-5 electrical read is "
                                  "likely incomplete; verify before use."})
 
+    # --- Racking BOM table (Solar rows 33-90): K2 shingle roof / K2 ground mount ---
+    _run_block("racking", flags, solar_rows, lambda: _racking_block(planset), solar_special)
+
     # --- Blocks still NOT auto-fed by the v2 extractor: flag, do NOT guess ---
     flags += _missing_input_flags(planset)
 
     return solar_rows, elec_rows, solar_special, elec_special, flags
+
+
+def _racking_block(planset):
+    """Solar racking BOM (rows 33-90) from the extractor's planset.racking table. Routes by attachment
+    type: K2 ground -> racking_engine.k2_ground_mount (rows 73-90); K2 shingle -> roof rows 33-52 with
+    the planset-table quantities authoritative and the engine formulas applied for the computed rows
+    (deck screw = 4*attach, end cap = plan end clamps, ground lug = rows+1, wire clip = modules*2).
+    Returns (rows, flags, overrides). Anything the table can't resolve is FLAGGED, never guessed.
+
+    Orientation-dependent formula cross-checks (resolve_racking's attachment/rail validation, which
+    needs the rotated-raster per-array orientation) are deferred to the orientation sub-part; the
+    planset-table values are delivered as authoritative in the meantime."""
+    rk = getattr(planset, "racking", None) or {}
+    rows: dict[int, int] = {}
+    overrides: dict[int, tuple] = {}
+    flags: list = []
+    fmt = rk.get("format")
+    if not rk or fmt in (None, "absent"):
+        flags.append({"level": "HARD", "item": "racking_not_read",
+                      "msg": "Racking BOM table could not be read from the planset (no PV-3 text table "
+                             "and no recognizable image BOM sheet). Build Solar racking rows 33-90 by hand."})
+        return rows, flags, overrides
+
+    at = rk.get("attachment_type")
+    system = rk.get("system_type")
+    mc = int(rk.get("module_count") or 0)
+
+    # --- K2 GROUND MOUNT (rows 73-90) — straight through the existing GM engine ---
+    if system == "ground" or at == "K2_GROUND":
+        table = rk.get("ground_bom_table") or {}
+        if not table:
+            flags.append({"level": "HARD", "item": "racking_gm_table_empty",
+                          "msg": f"K2 ground-mount detected ({rk.get('source')}) but no BOM lines were "
+                                 f"resolved. Unresolved: {rk.get('unresolved')}. Populate rows 73-90 by hand."})
+            return rows, flags, overrides
+        r, ov, f = re_eng.k2_ground_mount(table, bool(rk.get("has_enphase")), mc)
+        rows.update(r); overrides.update(ov); flags.extend(f or [])
+        for u in (rk.get("unresolved") or []):
+            flags.append({"level": "WARN", "item": "racking_line_unresolved",
+                          "msg": f"K2 GM BOM line not mapped to a template row: {u}. Verify/add it."})
+        return rows, flags, overrides
+
+    # --- K2 SHINGLE ROOF (rows 33-52) — planset table authoritative ---
+    if at == "K2_SHINGLE":
+        roof = rk.get("roof") or {}
+        att, rails, splice = roof.get("attachments"), roof.get("rails"), roof.get("splice")
+        mid, ends = roof.get("mid_clamps"), roof.get("end_clamps")
+        if att is not None:
+            rows[33] = att                                   # K2 Multimount shingle attachment
+            rows[46] = att                                   # K2 rail clamp = attachment qty (truth)
+            rows[35] = re_eng.f_deck_screw(att)              # deck screw = 4*attach (default; lag row 34 alt)
+        if rails is not None:
+            rows[45] = rails                                 # K2 CrossRail
+        if splice is not None:
+            rows[47] = splice                                # K2 splice
+        if mid is not None or ends is not None:
+            rows[48] = (mid or 0) + (ends or 0)              # K2 cross (combo) clamp = mid + end
+        if ends is not None:
+            rows[51] = ends                                  # K2 end cap = plan end-clamp qty (truth)
+            if ends % 4 == 0:
+                rows[50] = ends // 4 + 1                      # K2 ground lug = rows+1 (rows = end_clamps/4)
+            else:
+                flags.append({"level": "NOTE", "item": "racking_ground_lug_uncomputed",
+                              "msg": f"End clamps={ends} not divisible by 4, so the row count "
+                                     f"(end_clamps/4) and ground-lug qty couldn't be computed. Verify."})
+        if mc:
+            rows[52] = mc * 2                                # K2 wire-management clip = modules*2
+        if rk.get("has_enphase"):
+            flags.append({"level": "NOTE", "item": "racking_mlpe_lug_pending",
+                          "msg": "Enphase micros present — K2 MLPE lug (row 49) needs the micro count; "
+                                 "not auto-populated. Add row 49 manually."})
+        missing = [k for k, v in (("attachments", att), ("rails", rails), ("splice", splice),
+                                  ("mid_clamps", mid), ("end_clamps", ends)) if v is None]
+        if missing:
+            flags.append({"level": "HARD", "item": "racking_table_incomplete",
+                          "msg": f"Roof racking table read from {rk.get('source')} but missing fields "
+                                 f"{missing}. Those rows were not populated — verify the PV-3 BOM table."})
+        flags.append({"level": "NOTE", "item": "racking_orientation_crosschecks_deferred",
+                      "msg": "Roof racking quantities delivered from the planset BOM table (authoritative). "
+                             "Orientation-based formula cross-checks (attachment/rail validation) are "
+                             "deferred to the per-array orientation sub-part."})
+        return rows, flags, overrides
+
+    # --- S-5! metal / unrecognized — read but not auto-routed (don't guess) ---
+    flags.append({"level": "HARD", "item": "racking_attachment_unrouted",
+                  "msg": f"Racking attachment type {at!r} (system {system!r}) is not auto-routed yet "
+                         f"(K2 shingle and K2 ground are wired; S-5! metal pending validation). "
+                         f"Table read: {rk.get('roof') or rk.get('ground_bom_table')}. Populate manually."})
+    return rows, flags, overrides
 
 
 def _missing_input_flags(planset) -> list[dict]:
@@ -187,7 +279,6 @@ def _missing_input_flags(planset) -> list[dict]:
     # PV-5 electrical (disconnects, breakers, meter, MSP, taps, gateway) is now wired in _build_blocks.
     # These remain unwired pending their own extractor enrichment:
     needed = [
-        ("racking", "per-array orientation (rotated raster), the planset racking BOM table, and attachment type"),
         ("jboxes", "strings-per-array split by roof type (shingle/rail/metal/ground)"),
         ("micro_accessories", "microinverter SKU + branch-circuit count (Enphase Engage/combiner rows)"),
         ("homeline_msp_breaker", "a NEW Homeline MSP interconnection breaker (row-128 fallback) — "
@@ -312,5 +403,7 @@ def build_bom(planset_pdf_path: str, coperniq_project_dict: dict,
             "csr_note_check": el.get("csr_note_check"),
             "one_line_text": el.get("one_line_text"),
         },
+        "racking": {k: v for k, v in (getattr(planset, "racking", None) or {}).items()
+                    if k != "raw_rows"},
     }
     return data, confidence

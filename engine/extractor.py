@@ -94,6 +94,11 @@ class PlansetData:
     # orchestrator merges these straight into FLAGS_FOR_HUMAN_REVIEW.
     extraction_flags: list = field(default_factory=list)
 
+    # --- Racking BOM table (PV-3 / PV-3.x) — read from the text layer where present, else Vision ---
+    # {format, system_type, attachment_type, module_count, roof:{...}, ground_bom_table:{pn:qty},
+    #  has_enphase, source, unresolved:[...]}. Drives the orchestrator's racking block (Solar 33-90).
+    racking: dict = field(default_factory=dict)
+
 
 class PlansetExtractor:
     """
@@ -460,6 +465,207 @@ class PlansetExtractor:
                 out.append(a)
         return out
 
+    # ---------- Racking BOM table (PV-3 / PV-3.x) ----------
+    @staticmethod
+    def _classify_attachment(blob: str):
+        """(system_type, attachment_type) from racking-table text/desc. system_type roof|ground;
+        attachment_type K2_GROUND | K2_SHINGLE | S5_PROTEABRACKET | S5_SOLARFOOT | None."""
+        U = (blob or "").upper()
+        if (any(t in U for t in ("CROSSRAIL 80", "CROSSRAIL80", "CR80", "GROUND MOUNT", "TOP CAP",
+                                  "GROUND SCREW", "PIPE BRACKET", "PIPE - BRACKET", "N/S PIPE"))
+                or any(pn in U for pn in ("4001370", "4000198", "4000175", "4001221", "4000708"))):
+            return "ground", "K2_GROUND"
+        if "PROTEABRACKET" in U or "PROTEA" in U or "S-5" in U or "STANDING SEAM" in U:
+            return "roof", "S5_PROTEABRACKET"
+        if "SOLARFOOT" in U or "SOLAR FOOT" in U:
+            return "roof", "S5_SOLARFOOT"
+        if any(t in U for t in ("MULTIMOUNT", "MULTI MOUNT", "MULTI-MOUNT", "SHINGLE", "4000282", "4000819")):
+            return "roof", "K2_SHINGLE"
+        return "roof", None
+
+    @staticmethod
+    def _parse_roof_racking_text(full_text: str):
+        """Parse the inline PV-3 BILL OF MATERIALS table (EQUIPMENT | QTY | DESCRIPTION triples, generic
+        labels). Returns ({attachments,rails,splice,mid_clamps,end_clamps,modules}, triples). The block
+        is scoped from the BILL OF MATERIALS header so the roof-config table below it isn't read."""
+        lines = [l.strip() for l in (full_text or "").splitlines()]
+        try:
+            start = next(i for i, l in enumerate(lines) if "BILL OF MATERIAL" in l.upper())
+        except StopIteration:
+            start = 0
+        block = lines[start:]
+        triples = []
+        for j in range(1, len(block) - 1):
+            if re.fullmatch(r"0*\d{1,4}", block[j]):
+                triples.append((block[j - 1].upper(), int(block[j]), block[j + 1].upper()))
+        out = {"attachments": None, "rails": None, "splice": None,
+               "mid_clamps": None, "end_clamps": None, "modules": None}
+        for label, qty, desc in triples:
+            L = label + " " + desc
+            if "END CLAMP" in L:
+                out["end_clamps"] = qty
+            elif "MODULE CLAMP" in label or ("MID" in L and "CLAMP" in L):
+                out["mid_clamps"] = qty
+            elif "ATTACHMENT" in label or "MULTIMOUNT" in L:
+                out["attachments"] = qty
+            elif label.startswith("RAIL") or "CROSSRAIL" in L:
+                out["rails"] = qty
+            elif "SPLICE" in L:
+                out["splice"] = qty
+            elif "SOLAR PV MODULE" in label or label == "MODULES":
+                out["modules"] = qty
+        return out, triples
+
+    @staticmethod
+    def _normalize_gm_key(part_number, description):
+        """Map a K2 ground-mount BOM row to a key k2_ground_mount() recognizes — by DESCRIPTION first
+        (robust to OCR'd / variant part numbers), part number as backup. Returns None if unrecognized
+        (caller flags it; never guessed)."""
+        U = (description or "").upper()
+        P = (part_number or "").upper().strip()
+        if "CROSSRAIL 80" in U or "CROSSRAIL80" in U or "CR80" in U or P in ("4001370", "4000708"):
+            if "172" in U or P == "4000708":
+                return "rail_172"
+            return "rail_216"            # 216" default (incl. P==4001370)
+        if "HEYCLIP" in U or "SUNRUNNER" in U or P == "4000382":
+            return "4000382"             # rule 1: NEVER on a GM BOM
+        if "CROSS CAP" in U or P == "4000372":
+            return "k2_cross_cap"        # rule 3: NEVER on a GM BOM
+        if "MICRO" in U or "MLPE" in U or P in ("4000629-H", "4000629"):
+            return "4000629-H"           # rule 2: only with Enphase
+        if "END CAP" in U or P == "4001221":
+            return "end_cap"             # rule 5: COMPUTED, table value ignored
+        if "WIRE" in U or ("CLIP" in U and "CROSS" not in U) or P == "4000069":
+            return "wire_clip"           # rule 6: COMPUTED, table value ignored
+        if "PIPE COUPLING" in U:
+            return "pipe_coupling_3"     # rule 4: new SKU row 84
+        if "SPLICE" in U or "CONNECTOR" in U or P == "4001196":
+            return "splice"
+        if "TOP CAP" in U or P == "4000198":
+            return "top_cap"
+        if "BRACKET" in U or P in ("4000175", "4000075"):
+            return "pipe_bracket"
+        if "CROSS CLAMP" in U or "MID CLAMP" in U or "END CLAMP" in U or "COMBO" in U or P in ("4000145", "4000035"):
+            return "combo_clamp"
+        if "GROUND LUG" in U or P == "4000006-H":
+            return "ground_lug"
+        if "LENGTH 10" in U or "10 FT" in U or "10FT" in U:
+            return "pipe_10ft"
+        if "GROUND SCREW" in U:
+            return "ground_screw"
+        if "N/S" in U and ("REAR" in U or "120" in U):
+            return "ns_pipe_rear_120"
+        if "N/S" in U and ("FRONT" in U or "60" in U):
+            return "ns_pipe_front_60"
+        if "DIAGONAL" in U or "BRACE" in U:
+            return "diag_brace"
+        return None
+
+    def _parse_ground_racking_text(self, full_text: str):
+        """Parse an inline (text-layer) K2 GM BOM table into {gm_key: qty}. Untested vs a text GM
+        planset (our GM samples are images) — present so a future text GM resolves without Vision."""
+        lines = [l.strip() for l in (full_text or "").splitlines()]
+        table, unresolved = {}, []
+        for j in range(1, len(lines) - 1):
+            if re.fullmatch(r"0*\d{1,4}", lines[j]):
+                pn, desc = lines[j - 1], lines[j + 1]
+                key = self._normalize_gm_key(pn, desc)
+                if key:
+                    table[key] = table.get(key, 0) + int(lines[j])
+        return table
+
+    async def _vision_read_bom_table(self, pdf_path: str, page_indices: list):
+        """Vision-read the 'Bill of materials' table from FLATTENED-IMAGE PV-3.x sheets (no text layer).
+        Returns a merged list of {part_number, description, quantity} across all given pages — a two-
+        array GM whose BOM spans PV-3.1 + PV-3.2 is summed downstream by key."""
+        prompt = (
+            "This Tron Solar racking sheet has a 'Bill of materials' / equipment table. Return ONLY "
+            'JSON: {"rows":[{"part_number":"string or null","description":"string","quantity":integer}]}'
+            "\nRules: one object per table row. part_number = the leftmost code (e.g. 4001370, "
+            "4000006-H) or null if that cell is blank. quantity = the integer in the Quantity column "
+            "(ignore List price / Total columns). Transcribe description verbatim. If there is no such "
+            'table on the page, return {"rows":[]}.')
+        rows = []
+        for pi in page_indices:
+            b64 = self._pdf_page_to_base64(pdf_path, pi, label=f"racking_p{pi}")
+            raw = await self._call_claude([b64], prompt)
+            try:
+                data = self._parse_json(raw)
+            except (ValueError, json.JSONDecodeError):
+                log.error("racking BOM Vision parse failed on page %s", pi)
+                continue
+            for r in (data.get("rows") or []):
+                rows.append(r)
+        return rows
+
+    async def _extract_racking(self, pdf_path: str, module_count, has_enphase: bool) -> dict:
+        """Read the planset racking BOM table (Solar rows 33-90 source). Text layer where present
+        (roof inline table), Vision fallback for rasterized PV-3.x BOM sheets. Returns the racking
+        dict consumed by the orchestrator's racking block; format='absent' when nothing is found."""
+        out = {"format": "absent", "system_type": None, "attachment_type": None,
+               "module_count": module_count, "has_enphase": bool(has_enphase),
+               "roof": None, "ground_bom_table": None, "source": None,
+               "raw_rows": None, "unresolved": []}
+        doc = fitz.open(pdf_path)
+        try:
+            pages = []
+            for i in range(doc.page_count):
+                full = doc[i].get_text() or ""
+                wc = len(doc[i].get_text("words"))
+                big = sum(1 for im in doc[i].get_images(full=True) if im[2] > 400 and im[3] > 400)
+                pages.append((i, full, full.upper(), wc, big))
+        finally:
+            doc.close()
+
+        # 1) INLINE TEXT table (roof or ground): only accept a page that actually PARSES into a
+        # substantive table. (A sheet-INDEX "BILL OF MATERIAL" reference on the cover, or stray
+        # racking words in the general notes, must NOT be mistaken for the table itself.)
+        for i, full, U, wc, big in pages:
+            if "BILL OF MATERIAL" not in U or wc <= 150:
+                continue
+            system, at = self._classify_attachment(full)
+            if system == "ground":
+                table = self._parse_ground_racking_text(full)
+                if len(table) >= 3:
+                    out.update(format="ground_text", system_type="ground", attachment_type=at,
+                               source=f"page {i} (text layer)", ground_bom_table=table)
+                    return out
+            else:
+                roof, triples = self._parse_roof_racking_text(full)
+                if sum(1 for v in roof.values() if v is not None) >= 3:
+                    out.update(format="roof_text", system_type=system, attachment_type=at,
+                               source=f"page {i} (text layer)", roof=roof, raw_rows=triples)
+                    return out
+
+        # 2) FLATTENED-IMAGE BOM sheets ('BILL OF MATERIAL' sheet, title-block-only text + big images).
+        img_pages = [i for i, full, U, wc, big in pages
+                     if "BILL OF MATERIAL" in U and wc < 140 and big >= 1]
+        if img_pages:
+            rows = await self._vision_read_bom_table(pdf_path, img_pages)
+            blob = " ".join(f"{r.get('part_number') or ''} {r.get('description') or ''}" for r in rows)
+            system, at = self._classify_attachment(blob)
+            out["source"] = f"pages {img_pages} (flattened image — Vision)"
+            out["system_type"], out["attachment_type"] = system, at
+            out["raw_rows"] = rows
+            if system == "ground":
+                out["format"] = "ground_image_vision"
+                table = {}
+                for r in rows:
+                    key = self._normalize_gm_key(r.get("part_number"), r.get("description"))
+                    qty = r.get("quantity")
+                    if key and isinstance(qty, int):
+                        table[key] = table.get(key, 0) + qty
+                    elif not key and qty:
+                        out["unresolved"].append(f"{r.get('part_number') or ''} {r.get('description') or ''} (qty {qty})")
+                out["ground_bom_table"] = table
+            else:
+                out["format"] = "roof_image_vision"
+                out["unresolved"].append("roof racking BOM is a flattened image; roof image parsing not "
+                                         "yet implemented — populate roof racking manually.")
+            return out
+
+        return out
+
     def _extract_electrical_from_text(self, pdf_path: str, page_index: Optional[int]) -> dict:
         """Read bus-kit breakers, CSR, and the expansion harness P/N from the PV-5 TEXT LAYER (exact
         vector text + coordinates) — deterministic, no Vision resolution limit. Returns
@@ -787,10 +993,25 @@ class PlansetExtractor:
                            f"{plan_csr or 'none'}. Verify PV-5 (a CSR main may be dropped or misread). "
                            f"Plan remains authoritative; this is a hold, not an override."})
 
+        # --- Step 5: Racking BOM table (Solar rows 33-90). Text layer where present (roof inline
+        # table); Vision fallback for rasterized PV-3.x BOM sheets. Attachment type classified for
+        # row routing. ---
+        en_blob = " ".join([electrical_data.get("one_line_text") or "",
+                            cover_data.get("inverter_model") or "",
+                            cover_data.get("inverter_manufacturer") or ""]).upper()
+        has_enphase = "ENPHASE" in en_blob or "IQ8" in en_blob
+        module_count = cover_data.get("module_quantity") or 0
+        try:
+            racking = await self._extract_racking(pdf_path, module_count, has_enphase)
+        except Exception as e:  # noqa: BLE001 — never fail the whole run on the racking read
+            racking = {"format": "absent", "unresolved": [f"racking extraction error: {e}"]}
+            warnings.append(f"racking table extraction failed: {e}")
+
         # --- Merge and return ---
         planset = self._merge(cover_data, electrical_data, array_data,
                               string_data, mount_kit, warnings)
         planset.extraction_flags = extraction_flags
+        planset.racking = racking
         return planset
 
     async def _extract_string_map(self, image_b64: str) -> dict:
