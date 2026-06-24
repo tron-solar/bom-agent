@@ -113,13 +113,16 @@ def ac_disconnects(disconnects):
         elif amp == 200:
             bucket["200"] += 1
 
-        # fuses for fused disconnects (2 each, by the FUSE rating drawn inside)
+        # fuses for fused disconnects (2 each, by the FUSE rating drawn inside). The fuse amp must be
+        # READ (extractor resolves it from the PV-5 text layer / Master Note) — never defaulted to the
+        # disconnect rating. A null/unmapped fuse_amp is a HARD flag, not a silent substitution.
         if fused:
-            f_amp = d.get("fuse_amp", amp)
+            f_amp = d.get("fuse_amp")
             f_row = _FRN_ROW.get(f_amp)
             if f_row is None:
                 flags.append({"level": "HARD", "item": "fuse_amp_unmapped",
-                              "detail": f"{f_amp}A fuse has no FRN-R row"})
+                              "detail": f"{f_amp}A fuse has no FRN-R row (fuse rating must be read "
+                                        f"from the plan; not defaulted to the {amp}A disconnect size)"})
             else:
                 fuse_rows[f_row] = fuse_rows.get(f_row, 0) + 2
 
@@ -463,6 +466,18 @@ def meter_socket(new_meter_drawn, meter_pn=None):
     key = " ".join(str(meter_pn).upper().split()).strip()
     norm_table = {" ".join(k.upper().split()).strip(): v for k, v in _METER_SKU_ROW.items()}
     row = norm_table.get(key)
+    # U6281 family ONLY: the plan writes the -5T9- token but the catalog SKU is -5T6- (e.g.
+    # U6281-XL-200-5T9-AMS -> U6281-XL-200-5T6-AMS). If the verbatim P/N didn't match, retry with
+    # 5T9->5T6 so this resolves to the real meter-table row instead of Special Order. Applied only
+    # after a direct miss, so genuine -5T9 table entries (rows 92/94) keep matching unchanged.
+    if row is None and key.startswith("U6281") and "5T9" in key:
+        alt = key.replace("5T9", "5T6")
+        alt_row = norm_table.get(alt)
+        if alt_row is not None:
+            row = alt_row
+            flags.append({"level": "NOTE", "item": "meter_pn_normalized",
+                          "detail": f"U6281 meter P/N {str(meter_pn).strip()!r} normalized -5T9- -> "
+                                    f"-5T6- (catalog SKU) to match meter row {row}."})
     if row is None:
         pn = str(meter_pn).strip()
         rows[_METER_SPECIAL_ORDER_ROW] = 1

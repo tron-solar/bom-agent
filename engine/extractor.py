@@ -446,6 +446,20 @@ class PlansetExtractor:
                 amps.append(int(a))
         return ("amps", sorted(set(amps))) if amps else (None, [])
 
+    @staticmethod
+    def _parse_fuse_amps(text: str):
+        """Find FUSE amperages drawn on the one-line: '60A FUSES', '(2) 40A FUSES', '40 A FUSE'.
+        Returns distinct amps in order of appearance. The leading '(N)' is a fuse COUNT, not the
+        rating, so it's ignored. 'FUSED' (the disconnect adjective, e.g. '60A FUSED AC DISCONNECT')
+        is deliberately NOT matched — only the noun FUSE/FUSES — so the disconnect rating is never
+        mistaken for the fuse rating."""
+        out = []
+        for m in re.finditer(r"(?:\(\s*\d+\s*\)\s*)?(\d{1,3})\s*A\s*FUSES?\b", (text or "").upper()):
+            a = int(m.group(1))
+            if a not in out:
+                out.append(a)
+        return out
+
     def _extract_electrical_from_text(self, pdf_path: str, page_index: Optional[int]) -> dict:
         """Read bus-kit breakers, CSR, and the expansion harness P/N from the PV-5 TEXT LAYER (exact
         vector text + coordinates) — deterministic, no Vision resolution limit. Returns
@@ -685,12 +699,45 @@ class PlansetExtractor:
             warnings.append("expansion mount: no plan keyword and no Master Note form supplied; "
                             "defaulted to wall — fetch get_form(Master Note) and pass master_note_form")
 
-        # Shared Master Note text (used by the harness + CSR cross-checks below).
+        # Shared Master Note text (used by the harness + CSR + fuse cross-checks below).
         mn_text = ""
         if isinstance(master_notes, dict):
             mn_text = " ".join(str(master_notes.get(k, "") or "") for k in
                                ("design_notes", "additional_notes", "installation_notes",
                                 "field_installation_notes"))
+
+        # --- Step 4.05: FUSED-disconnect FUSE amperage — TEXT-LAYER authoritative. The fuse rating is
+        # ALWAYS drawn on the one-line ("60A FUSES" / "(2) 40A FUSES"); a null fuse_amp from Vision is
+        # a MISSED read, not an absent value (Vision under-reads this fine print). For EVERY fused
+        # disconnect, resolve in order: (a) PRIMARY the PV-5 text layer (preferred OVER Vision);
+        # (b) SECONDARY the Master Note; (c) TERMINAL leave null -> the engine raises fuse_amp_unmapped.
+        # NEVER default the fuse to the disconnect rating — it must be read. ---
+        discos = electrical_data.get("ac_disconnects") or []
+        if any(d.get("fused") for d in discos):
+            tl_fuses = self._parse_fuse_amps(electrical_data.get("one_line_text") or "")
+            mn_fuses = self._parse_fuse_amps(mn_text)
+            fused_i = 0
+            for d in discos:
+                if not d.get("fused"):
+                    continue
+                vision_fa = d.get("fuse_amp")
+                resolved_fa, src = None, None
+                if tl_fuses:                       # text layer wins (positional, else first)
+                    resolved_fa = tl_fuses[fused_i] if fused_i < len(tl_fuses) else tl_fuses[0]
+                    src = "text_layer"
+                elif mn_fuses:
+                    resolved_fa = mn_fuses[fused_i] if fused_i < len(mn_fuses) else mn_fuses[0]
+                    src = "master_note"
+                if src is not None:
+                    d["fuse_amp"] = resolved_fa
+                    d["fuse_amp_source"] = src
+                    if vision_fa != resolved_fa:
+                        extraction_flags.append({
+                            "level": "NOTE", "item": "fuse_amp_source",
+                            "msg": f"Fused {d.get('amp')}A disconnect: fuse amp resolved to "
+                                   f"{resolved_fa}A from {src} (Vision read {vision_fa}). Fuse rating "
+                                   f"is read off the plan, not defaulted to the disconnect size."})
+                fused_i += 1
 
         # --- Step 4.1: Multi-source expansion HARNESS resolution (only when there is an expansion) ---
         # 1 direct Vision harness_pn field; 2 regex over the FULL one-line text; 3 Master Note text.
