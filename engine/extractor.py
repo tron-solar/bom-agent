@@ -286,12 +286,66 @@ class PlansetExtractor:
                             type(e).__name__, e, attempt + 1, delay)
                 await asyncio.sleep(delay)
 
+    @staticmethod
+    def _balance_brackets(s: str) -> str:
+        """Close any unclosed string / array / object in `s` (handles a response truncated by
+        max_tokens). String-aware: respects escapes so a brace inside a quoted value isn't counted."""
+        stack, in_str, esc = [], False, False
+        for ch in s:
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch in "{[":
+                stack.append(ch)
+            elif ch == "}" and stack and stack[-1] == "{":
+                stack.pop()
+            elif ch == "]" and stack and stack[-1] == "[":
+                stack.pop()
+        out = s + ('"' if in_str else "")
+        for ch in reversed(stack):
+            out += "}" if ch == "{" else "]"
+        return out
+
+    @staticmethod
+    def _cut_to_last_complete(head: str) -> str:
+        """Drop a dangling, incomplete top-level field: cut at the last comma seen at object depth 1
+        (string-aware). Lets us salvage every field parsed BEFORE a mid-body delimiter error."""
+        depth, in_str, esc, last_comma = 0, False, False, -1
+        for i, ch in enumerate(head):
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch in "{[":
+                depth += 1
+            elif ch in "}]":
+                depth -= 1
+            elif ch == "," and depth == 1:
+                last_comma = i
+        return head[:last_comma] if last_comma != -1 else head
+
     def _parse_json(self, raw: str) -> dict:
-        """Parse JSON from a Claude response.
+        """Parse JSON from a Claude response, with tolerant recovery.
 
         Strips markdown code fences, then extracts the object from the first '{' to the last '}'
-        (drops any prose the model wrapped around the JSON). On failure raises ValueError WITH the
-        raw response text included, so the caller/logs show what the model actually returned."""
+        (drops any prose the model wrapped around the JSON). If strict parsing fails it attempts, in
+        order: (1) remove trailing commas; (2) close unbalanced brackets (truncation by max_tokens);
+        (3) truncate at the parse-error position, drop the partial trailing field, and close — which
+        salvages every field that parsed cleanly before a mid-body delimiter error. Each successful
+        repair is logged. Raises ValueError (with the raw text) only if nothing recovers it."""
         clean = (raw or "").strip()
         if clean.startswith("```"):
             clean = clean.split("\n", 1)[-1]          # drop the opening ``` / ```json line
@@ -301,13 +355,32 @@ class PlansetExtractor:
         start, end = clean.find("{"), clean.rfind("}")
         if start != -1 and end > start:
             clean = clean[start:end + 1]
+        elif start != -1:                              # opening brace but no close -> truncated
+            clean = clean[start:]
+
+        first_err = None
         try:
             return json.loads(clean)
         except json.JSONDecodeError as e:
-            raise ValueError(
-                f"Claude response was not valid JSON ({e}). "
-                f"Raw response (first 1000 chars): {(raw or '')[:1000]!r}"
-            ) from e
+            first_err = e
+
+        for label, candidate in (
+            ("removed trailing comma(s)", re.sub(r",(\s*[}\]])", r"\1", clean)),
+            ("closed unbalanced brackets (truncation)", self._balance_brackets(clean)),
+            ("truncated at parse-error and closed brackets",
+             self._balance_brackets(self._cut_to_last_complete(clean[:first_err.pos]))),
+        ):
+            try:
+                result = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            log.warning("PV-5/JSON recovered via repair: %s (orig error: %s)", label, first_err)
+            return result
+
+        raise ValueError(
+            f"Claude response was not valid JSON and could not be repaired ({first_err}). "
+            f"Raw response (first 1000 chars): {(raw or '')[:1000]!r}"
+        ) from first_err
 
     def _page_text(self, pdf_path: str, page_index: Optional[int]) -> str:
         """Raw text layer of one page (for the deterministic equipment-block parse). '' if unavailable."""
@@ -407,26 +480,47 @@ class PlansetExtractor:
 
         buskit_lbl = next((ctr(*w[:4]) for w in words
                            if "BUS-KIT" in w[4].upper() or "BUSKIT" in w[4].upper()), None)
-        gw = [ctr(*w[:4]) for w in words if "GATEWAY" in w[4].upper()]
-        gateway_lbl = (sum(p[0] for p in gw) / len(gw), sum(p[1] for p in gw) / len(gw)) if gw else None
+
+        # EXISTING-breaker markers: an "(E)" token (e.g. "(E) 50A/2P" = the existing house main/PV
+        # breaker) means the adjacent breaker is EXISTING — never a NEW bus-kit/CSR breaker. Exclude
+        # those so a retained breaker isn't shipped as a CSR (the BOM lists NEW parts only). Breaker
+        # labels are often rendered as VERTICAL text (tall, ~4pt-wide bbox), so the "(E)" marker can
+        # sit either to the LEFT (horizontal text) or ABOVE (vertical text) of the breaker token.
+        existing_marks = [(x0, y0, x1, y1) for x0, y0, x1, y1, w, *_ in words
+                          if w.strip().upper().startswith("(E)") or w.strip().upper() == "E)"]
+
+        def is_existing(bx0, by0, bx1, by1, w):
+            if w.strip().upper().startswith("(E)"):
+                return True
+            bcx, bcy = (bx0 + bx1) / 2.0, (by0 + by1) / 2.0
+            for ex0, ey0, ex1, ey1 in existing_marks:
+                ecx, ecy = (ex0 + ex1) / 2.0, (ey0 + ey1) / 2.0
+                same_row = abs(ecy - bcy) <= 6 and -5 <= bx0 - ex1 <= 45   # marker just LEFT
+                same_col = abs(ecx - bcx) <= 6 and -5 <= by0 - ey1 <= 45   # marker just ABOVE
+                if same_row or same_col:
+                    return True
+            return False
 
         breakers = []  # (amp, poles, center)
         for x0, y0, x1, y1, w, *_ in words:
+            if is_existing(x0, y0, x1, y1, w):
+                continue
             for mm in re.finditer(r"(\d{2,3})A/(\d)P", w.upper()):
                 breakers.append((int(mm.group(1)), int(mm.group(2)), ctr(x0, y0, x1, y1)))
 
         if buskit_lbl is None:
             return out   # can't scope the bus-kit cluster from text -> let Vision handle the breakers
 
-        R_BUSKIT, R_GATEWAY = 90.0, 160.0   # proximity thresholds (pts) — heuristic, calibrated on PV-5
+        # Anchor BOTH classifications on the BUS-KIT label (a single, reliable token). The GATEWAY
+        # label is NOT a reliable anchor — "GATEWAY" also appears in far-away note references that
+        # corrupt an averaged position. A CSR feeds the gateway right beside the bus-kit, so it sits
+        # in a thin annulus just OUTSIDE the bus-kit cluster; the existing main and the enclosure
+        # rating sit farther out (or are excluded as "(E)" / non-breaker tokens).
+        R_BUSKIT, R_CSR = 90.0, 130.0   # proximity thresholds (pts), calibrated on PV-5 one-lines
         out["buskit_breakers"] = [{"amp": a, "poles": p}
                                   for a, p, c in breakers if dist(c, buskit_lbl) <= R_BUSKIT]
-        if gateway_lbl is not None:
-            out["csr_breakers"] = sorted({a for a, p, c in breakers
-                                          if dist(c, gateway_lbl) <= R_GATEWAY
-                                          and dist(c, buskit_lbl) > R_BUSKIT})
-        else:
-            out["csr_breakers"] = []
+        out["csr_breakers"] = sorted({a for a, p, c in breakers
+                                      if R_BUSKIT < dist(c, buskit_lbl) <= R_CSR})
         return out
 
     async def extract(self, pdf_path: str, coperniq_project: Optional[dict] = None,
@@ -457,6 +551,23 @@ class PlansetExtractor:
         else:
             pv5_b64 = self._pdf_page_to_base64(pdf_path, pv5_page, label="PV-5")
             electrical_data = await self._extract_three_line(pv5_b64)
+            if electrical_data.pop("_pv5_parse_error", None):
+                # The Vision structured read failed and could not be repaired. Make it LOUD — never
+                # let it pass as if valid. The deterministic text-layer fields (Step 2.5) and the
+                # PV-5/PV-3 equipment-text counts (Step 3.5) still fill in below; everything ELSE
+                # (disconnects, gateway, meter/MSP, msp/meter flags) is missing and must be verified.
+                extraction_flags.append({
+                    "level": "HARD", "item": "pv5_electrical_unreliable",
+                    "msg": "PV-5 Vision read could not be parsed/recovered — the structured electrical "
+                           "fields (AC/DC disconnects, gateway, meter, MSP) are MISSING and unreliable. "
+                           "Deterministic text-layer fields (bus-kit, CSR, harness, PW3/expansion "
+                           "counts) still apply. Build the rest of the electrical BOM from PV-5 by hand."})
+
+        # one_line_text now comes from the PV-5 TEXT LAYER (exact), not a Vision transcription — this
+        # removed the ~3000-char field that was bloating/breaking the Vision JSON. It feeds the
+        # supply-side-tap substring match (orchestrator rows 26-28) and the harness one_line source.
+        electrical_data["one_line_text"] = (self._page_text(pdf_path, pv5_page)
+                                            if pv5_page is not None else "")
 
         # --- Step 2.5: Read bus-kit breakers + CSR from the PV-5 TEXT LAYER (exact vector text +
         # coordinates) — deterministic, replaces the low-res Vision image read for these fields. The
@@ -762,9 +873,7 @@ Return ONLY valid JSON, no other text:
   "expansion_mount": "stack or wall or null",
 
   "buskit_breakers": [ {"amp": integer, "poles": integer} ],
-  "csr_breakers": [ integer ],
-
-  "one_line_text": "string"
+  "csr_breakers": [ integer ]
 }
 
 Rules — read the LABELS, not just the symbols:
@@ -818,20 +927,19 @@ Rules — read the LABELS, not just the symbols:
        rating matches the gateway. A breaker SYMBOL outside the bus-kit = CSR; the enclosure's printed
        rating label = not a breaker.
   * The EXISTING house-panel main (e.g. "(E) MAIN BREAKER TO HOUSE 200A/2P") is NEITHER — exclude it.
-- one_line_text: a FULL verbatim transcription of the one-line's text labels, callouts, and equipment
-  notes — INCLUDING the "EXPANSION HARNESS P/N 1875157-..." callout and supply-side tap SKUs
-  ("K4977", "NSI IT-3/0", "IT-250"). Do NOT summarize or drop callouts. Up to ~3000 characters.
 - Use [] / 0 / false for absent items; null only for the string/number fields that say "or null"."""
 
         raw = await self._call_claude([image_b64], prompt)
         try:
             return self._parse_json(raw)
         except (ValueError, json.JSONDecodeError) as e:
-            # Don't fail the whole run on a PV-5 parse miss — log the raw response and return the
-            # minimal shape so the orchestrator flags missing electrical detail instead of crashing.
-            log.error("PV-5 three-line parse failed: %s", e)
+            # The structured electrical read could not be parsed OR recovered. Do NOT silently return
+            # an empty dict — that would degrade quietly into wrong downstream defaults. Surface a
+            # sentinel so extract() raises a HARD flag making the unreliable read explicit. The
+            # deterministic text-layer fields (bus-kit, CSR, harness, counts) still apply on top.
+            log.error("PV-5 three-line parse failed (unrecoverable): %s", e)
             log.error("PV-5 raw response (first 1000 chars): %r", (raw or "")[:1000])
-            return {}
+            return {"_pv5_parse_error": str(e)}
 
     async def _extract_roof_plan(self, image_b64: str, module_wattage: float) -> dict:
         """Extract array layout from PV-3 roof plan."""
