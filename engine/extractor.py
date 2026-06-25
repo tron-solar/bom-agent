@@ -605,16 +605,35 @@ class PlansetExtractor:
     # ---------- J-boxes (Solar rows 25/26): strings-per-plane + roof type ----------
     @staticmethod
     def _parse_strings_text(text: str):
-        """[(string_number, module_count|None)] from the stringing page text ('STRING #1 (9 MODULES)'),
-        distinct by string number, sorted by number. Module count is filled from whichever mention has
-        it (a string is often labeled twice — once with modules, once as 'STRING #n/MPPT #m')."""
+        """[(string_number, module_count|None)] from the stringing page text, distinct by number,
+        sorted. Two passes so a '(NN MODULES)' count is captured even when '/MPPT #m / INV #k' text
+        sits between 'STRING #n' and the count (Morrow: 'STRING #1/MPPT #1/ INV #1 (07 MODULES)') —
+        the tempered match keeps the count bound to its own string by refusing to cross another
+        'STRING #' label."""
+        U = (text or "").upper()
         seen = {}
-        for m in re.finditer(r"STRING\s*#?\s*(\d+)\s*(?:\(\s*0*(\d+)\s*MODULES?\s*\))?", (text or "").upper()):
+        for m in re.finditer(r"STRING\s*#?\s*(\d+)", U):            # every string number (with or w/o modules)
+            seen.setdefault(int(m.group(1)), None)
+        for m in re.finditer(                                       # number -> the (NN MODULES) that follows it
+                r"STRING\s*#?\s*(\d+)(?:(?!STRING\s*#?\s*\d).)*?\(\s*0*(\d+)\s*MODULES?\s*\)",
+                U, re.DOTALL):
             n = int(m.group(1))
-            mods = int(m.group(2)) if m.group(2) else None
-            if n not in seen or (seen[n] is None and mods is not None):
-                seen[n] = mods
+            if seen.get(n) is None:
+                seen[n] = int(m.group(2))
         return [(n, seen[n]) for n in sorted(seen)]
+
+    def _count_drawn_jb_tokens(self, pdf_path: str, page_index: Optional[int]):
+        """Count the JUNCTION-BOX symbols drawn on the stringing page from the TEXT LAYER: standalone
+        'JB' word tokens minus 1 for the legend entry ('JB - JUNCTION BOX'). More reliable than the
+        Vision drawn count. Returns None if there are no JB tokens at all (can't cross-check)."""
+        if page_index is None:
+            return None
+        doc = fitz.open(pdf_path)
+        try:
+            n = sum(1 for w in doc[page_index].get_text("words") if w[4].strip().upper() == "JB")
+        finally:
+            doc.close()
+        return max(0, n - 1) if n > 0 else None
 
     def _roof_type(self, pdf_path: str, pv3_page: Optional[int], mount_type: str) -> str:
         """shingle | metal | other | ground. Ground mount -> 'ground'. Roof -> from the PV-3 ROOF
@@ -1192,21 +1211,36 @@ class PlansetExtractor:
             roof_type = self._roof_type(pdf_path, pv3_page, mount_type)
             strings = self._parse_strings_text(self._page_text(pdf_path, string_page)
                                                if string_page is not None else "")
-            planes, plane_src = self._strings_per_plane(strings, array_data.get("arrays") or [], mount_type)
-            jbox_source = f"text layer — {plane_src}"
-            if planes is None:
-                vplanes = [{"label": f"Plane {p.get('plane')}", "strings": int(p.get("string_count") or 0)}
-                           for p in (string_data.get("planes") or []) if p.get("string_count") is not None]
-                if vplanes:
-                    planes = vplanes
-                    jbox_source = f"Vision string map (text per-plane unresolved: {plane_src})"
+            total_strings = len(strings)
+            arrays_list = array_data.get("arrays") or []
+            plane_count = len([a for a in arrays_list if a.get("module_count")])
+            drawn_text = self._count_drawn_jb_tokens(pdf_path, string_page)
+            # Per-plane string resolution (the J-box FORMULA is the sole truth; the drawn JB count is
+            # NOT a validator — plansets draw J-boxes for wire-type transitions, so the drawn count can
+            # be LESS than the strings-per-J-box requirement). Two paths only:
+            #  1 NESTING: string module-sums nest contiguously+uniquely into the plane module-counts
+            #            (Lackey, Steele) -> per-plane counts -> compute + deliver.
+            #  2 NON-NESTING / inverter-grouped (Morrow): per-plane string count is NOT recoverable from
+            #            text. Do NOT infer it from plane_count (total_strings <= plane_count*4 does NOT
+            #            guarantee <=4 on every plane) and do NOT substitute the drawn count. -> unresolved
+            #            (orchestrator HARD-flags, surfacing the inputs as information only; no guess).
+            nested, nest_src = self._strings_per_plane(strings, arrays_list, mount_type)
+            if nested is not None:
+                planes, path, src = nested, "nested", f"text per-plane nest — {nest_src}"
+            else:
+                planes, path = None, "unresolved"
+                src = (f"strings don't nest into the {plane_count} plane module-counts "
+                       f"(inverter-grouped); per-plane string count is not recoverable from the text "
+                       f"layer (plane_count={plane_count}, total_strings={total_strings}).")
             jboxes = {"roof_type": roof_type, "mount_type": mount_type, "string_page": string_page,
-                      "planes": planes, "string_numbers": [n for n, _ in strings],
-                      "total_strings": (len(strings) or string_data.get("total_strings")),
-                      "drawn_jbox_count": string_data.get("drawn_jbox_count"),
-                      "source": jbox_source}
+                      "planes": planes, "resolution_path": path, "plane_count": plane_count,
+                      "string_numbers": [n for n, _ in strings], "string_modules": [m for _, m in strings],
+                      "total_strings": total_strings or string_data.get("total_strings"),
+                      "drawn_jbox_count_text": drawn_text,
+                      "drawn_jbox_count_vision": string_data.get("drawn_jbox_count"),
+                      "source": src}
             if planes is None:
-                jboxes["unresolved"] = plane_src
+                jboxes["unresolved"] = src
         except Exception as e:  # noqa: BLE001 — never fail the whole run on the J-box read
             jboxes = {"planes": None, "unresolved": f"jbox extraction error: {e}"}
             warnings.append(f"jbox extraction failed: {e}")

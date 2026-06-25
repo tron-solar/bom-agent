@@ -282,35 +282,39 @@ def _racking_block(planset):
 
 
 def _jbox_block(planset):
-    """J-boxes (Solar rows 25/26) from planset.jboxes: per-plane string counts + roof type.
-    qty = sum over planes of max(1, ceil(strings_on_plane / 4)); SKU row 25 (JB-1.2) for asphalt
-    shingle, row 26 (JB-3) for every other roof type and ground. Cross-checks the computed total
-    against the drawn JB count (NOTE on disagreement). Flags — never guesses — if the per-plane
-    string assignment couldn't be resolved."""
+    """J-boxes (Solar rows 25/26) from planset.jboxes. qty = sum over planes of
+    max(1, ceil(strings_on_plane / 4)) — this FORMULA is the sole truth. SKU row 25 (JB-1.2) for
+    asphalt shingle, row 26 (JB-3) for every other roof type and ground.
+
+    The DRAWN JB count is surfaced as INFORMATION ONLY, never a validator: plansets draw J-boxes for
+    wire-type transitions ("subject to change in the field"), not per the strings-per-J-box rule, so
+    computed > drawn is EXPECTED and is not flagged. When the per-plane string count can't be resolved
+    from the text (inverter-grouped strings), HARD-flag and surface the inputs — never guess a number
+    (not from plane_count, not from the drawn count)."""
     jb = getattr(planset, "jboxes", None) or {}
     rows: dict[int, int] = {}
     flags: list = []
+    drawn_text = jb.get("drawn_jbox_count_text")
+    drawn_vision = jb.get("drawn_jbox_count_vision")
     planes = jb.get("planes")
     if not planes:
-        flags.append({"level": "HARD", "item": "jbox_strings_unresolved",
-                      "msg": f"J-box count not computed — per-plane string assignment could not be "
-                             f"resolved ({jb.get('unresolved') or 'no string map read'}). Add the J-box "
-                             f"line (rows 25/26) manually from the string map."})
+        flags.append({"level": "HARD", "item": "jbox_per_plane_unresolved",
+                      "msg": f"J-box count NOT computed — {jb.get('unresolved') or 'string map not read'} "
+                             f"Inputs (information only, no number guessed): plane_count="
+                             f"{jb.get('plane_count')}, total_strings={jb.get('total_strings')}, "
+                             f"string_numbers={jb.get('string_numbers')}, "
+                             f"string_modules={jb.get('string_modules')}, drawn JB tokens(text)="
+                             f"{drawn_text}, drawn(Vision)={drawn_vision}. Resolve rows 25/26 by hand "
+                             f"from the string map (strings group by inverter, not by plane)."})
         return rows, flags
     row, total = re_eng.f_jboxes(planes, jb.get("roof_type"))
     rows[row] = total
-    drawn = jb.get("drawn_jbox_count")
     sku = "JB-1.2 (row 25)" if row == 25 else "JB-3 (row 26)"
-    if isinstance(drawn, int) and drawn > 0 and drawn != total:
-        flags.append({"level": "NOTE", "item": "jbox_count_vs_drawn",
-                      "msg": f"J-box count computed {total} ({sku}) from per-plane strings "
-                             f"{[p.get('strings') for p in planes]}, but the plan draws {drawn} JB(s). "
-                             f"Verify the string-per-plane read."})
-    else:
-        flags.append({"level": "NOTE", "item": "jbox_count",
-                      "msg": f"J-boxes: {total}x {sku} from per-plane strings "
-                             f"{[p.get('strings') for p in planes]} (roof_type={jb.get('roof_type')}; "
-                             f"{jb.get('source')}). Drawn JB cross-check: {drawn}."})
+    flags.append({"level": "NOTE", "item": "jbox_count",
+                  "msg": f"J-boxes: {total}x {sku} (formula, truth) via '{jb.get('resolution_path')}' — "
+                         f"{jb.get('source')}. Drawn JB count {drawn_text} (text) / {drawn_vision} "
+                         f"(Vision) is informational only — plansets draw J-boxes for wire-type "
+                         f"transitions, so it can be fewer than required and is NOT a cross-check."})
     return rows, flags
 
 
