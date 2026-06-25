@@ -99,6 +99,10 @@ class PlansetData:
     #  has_enphase, source, unresolved:[...]}. Drives the orchestrator's racking block (Solar 33-90).
     racking: dict = field(default_factory=dict)
 
+    # --- J-boxes (Solar rows 25/26): per-plane string counts + roof type. Drives f_jboxes. ---
+    # {roof_type, mount_type, planes:[{label,strings}], total_strings, drawn_jbox_count, source}.
+    jboxes: dict = field(default_factory=dict)
+
 
 class PlansetExtractor:
     """
@@ -597,6 +601,66 @@ class PlansetExtractor:
             for r in (data.get("rows") or []):
                 rows.append(r)
         return rows
+
+    # ---------- J-boxes (Solar rows 25/26): strings-per-plane + roof type ----------
+    @staticmethod
+    def _parse_strings_text(text: str):
+        """[(string_number, module_count|None)] from the stringing page text ('STRING #1 (9 MODULES)'),
+        distinct by string number, sorted by number. Module count is filled from whichever mention has
+        it (a string is often labeled twice — once with modules, once as 'STRING #n/MPPT #m')."""
+        seen = {}
+        for m in re.finditer(r"STRING\s*#?\s*(\d+)\s*(?:\(\s*0*(\d+)\s*MODULES?\s*\))?", (text or "").upper()):
+            n = int(m.group(1))
+            mods = int(m.group(2)) if m.group(2) else None
+            if n not in seen or (seen[n] is None and mods is not None):
+                seen[n] = mods
+        return [(n, seen[n]) for n in sorted(seen)]
+
+    def _roof_type(self, pdf_path: str, pv3_page: Optional[int], mount_type: str) -> str:
+        """shingle | metal | other | ground. Ground mount -> 'ground'. Roof -> from the PV-3 ROOF
+        DESCRIPTION text. Only 'shingle' routes to JB-1.2 (row 25); everything else -> JB-3 (row 26)."""
+        if mount_type == "ground":
+            return "ground"
+        t = (self._page_text(pdf_path, pv3_page) or "").upper()
+        if "ASPHALT" in t or "SHINGLE" in t:
+            return "shingle"
+        if "STANDING SEAM" in t or "METAL" in t:
+            return "metal"
+        return "other"
+
+    @staticmethod
+    def _strings_per_plane(strings, arrays, mount_type):
+        """Assign strings to physical planes/arrays (strings never cross planes). Returns
+        (planes, source) where planes = [{'label','strings'}] or None if it can't be resolved.
+          - single plane/array -> all strings on one plane.
+          - multiple planes/arrays (roof OR a multi-array ground mount) -> match contiguous string
+            MODULE-count sums (from the string text) to the per-plane module counts (from the plan).
+            Strings are listed grouped by plane, so the running module sum closes a plane when it
+            equals a plane's module total. (A single-array ground mount falls into the single-plane
+            branch; a two-array GM is matched the same way as a multi-plane roof.)"""
+        n = len(strings)
+        if n == 0:
+            return None, "no STRING #n labels found on the stringing page"
+        plane_mods = [int(a.get("module_count") or 0) for a in (arrays or [])]
+        plane_mods = [m for m in plane_mods if m]
+        if len(plane_mods) <= 1:
+            return [{"label": "Plane 1", "strings": n}], "single plane (all strings on one plane)"
+        if any(mods is None for _, mods in strings):
+            return None, "multiple planes but string module counts missing from text"
+        remaining = list(plane_mods)
+        planes, run, cnt, grp = [], 0, 0, 1
+        for _, mods in strings:
+            run += mods
+            cnt += 1
+            if run in remaining:
+                remaining.remove(run)
+                planes.append({"label": f"Plane {grp}", "strings": cnt})
+                grp += 1
+                run, cnt = 0, 0
+        if run != 0 or remaining:
+            return None, (f"per-plane module-sum match failed (leftover modules={run}, "
+                          f"unmatched planes={remaining})")
+        return planes, "text per-plane via string module-count match"
 
     def _detect_mount_type(self, pdf_path: str, pv3_page: Optional[int], cover_blob: str = "") -> str:
         """roof | ground. Keyed on the PV-3 sheet NAME (the authoritative signal): roof plansets title
@@ -1120,11 +1184,39 @@ class PlansetExtractor:
             racking = {"format": "absent", "unresolved": [f"racking extraction error: {e}"]}
             warnings.append(f"racking table extraction failed: {e}")
 
+        # --- Step 6: J-boxes (Solar rows 25/26). Strings-per-plane TEXT-FIRST (STRING #n labels +
+        # module counts on the routed stringing page), Vision string-map result as fallback. Roof type
+        # (shingle -> JB-1.2 row 25; everything else + ground -> JB-3 row 26) from the PV-3 ROOF
+        # DESCRIPTION / mount type. drawn_jbox_count (Vision) is the cross-check. ---
+        try:
+            roof_type = self._roof_type(pdf_path, pv3_page, mount_type)
+            strings = self._parse_strings_text(self._page_text(pdf_path, string_page)
+                                               if string_page is not None else "")
+            planes, plane_src = self._strings_per_plane(strings, array_data.get("arrays") or [], mount_type)
+            jbox_source = f"text layer — {plane_src}"
+            if planes is None:
+                vplanes = [{"label": f"Plane {p.get('plane')}", "strings": int(p.get("string_count") or 0)}
+                           for p in (string_data.get("planes") or []) if p.get("string_count") is not None]
+                if vplanes:
+                    planes = vplanes
+                    jbox_source = f"Vision string map (text per-plane unresolved: {plane_src})"
+            jboxes = {"roof_type": roof_type, "mount_type": mount_type, "string_page": string_page,
+                      "planes": planes, "string_numbers": [n for n, _ in strings],
+                      "total_strings": (len(strings) or string_data.get("total_strings")),
+                      "drawn_jbox_count": string_data.get("drawn_jbox_count"),
+                      "source": jbox_source}
+            if planes is None:
+                jboxes["unresolved"] = plane_src
+        except Exception as e:  # noqa: BLE001 — never fail the whole run on the J-box read
+            jboxes = {"planes": None, "unresolved": f"jbox extraction error: {e}"}
+            warnings.append(f"jbox extraction failed: {e}")
+
         # --- Merge and return ---
         planset = self._merge(cover_data, electrical_data, array_data,
                               string_data, mount_kit, warnings)
         planset.extraction_flags = extraction_flags
         planset.racking = racking
+        planset.jboxes = jboxes
         return planset
 
     async def _extract_string_map(self, image_b64: str) -> dict:
@@ -1151,6 +1243,8 @@ legend — do NOT infer string count from module count.
 
 Also report whether any text near the expansion unit says "stack" or "wall mount".
 
+Also count the JUNCTION BOX symbols drawn on the plan (the (N) JUNCTION BOX markers / JB symbols).
+
 Return ONLY valid JSON, no other text:
 {
   "planes": [
@@ -1158,6 +1252,7 @@ Return ONLY valid JSON, no other text:
     { "plane": 2, "string_numbers": [6,7], "string_count": 2 }
   ],
   "total_strings": 7,
+  "drawn_jbox_count": 2,
   "plan_mount": "stack or wall or null",
   "confidence": 0.0
 }
@@ -1166,6 +1261,7 @@ Rules:
 - string_count for a plane = number of distinct string colors confined to that plane
 - string_numbers lists the legend string numbers found on that plane
 - total_strings = sum of all planes' string_count (should equal the project string total)
+- drawn_jbox_count = how many junction-box symbols are actually drawn on the plan (0 if none visible)
 - plan_mount: "stack"/"wall" only if explicitly written near the expansion unit, else null
 - confidence 0.0-1.0 reflecting how clearly the colored strings could be separated per plane"""
 
@@ -1173,7 +1269,8 @@ Rules:
         try:
             return self._parse_json(raw)
         except Exception:
-            return {"planes": [], "total_strings": None, "plan_mount": None, "confidence": 0.0}
+            return {"planes": [], "total_strings": None, "drawn_jbox_count": None,
+                    "plan_mount": None, "confidence": 0.0}
 
     async def _extract_cover_sheet(self, image_b64: str) -> dict:
         """Extract all fields from PV-1 cover sheet."""

@@ -177,6 +177,9 @@ def _build_blocks(planset, project: dict):
     # --- Racking BOM table (Solar rows 33-90): K2 shingle roof / K2 ground mount ---
     _run_block("racking", flags, solar_rows, lambda: _racking_block(planset), solar_special)
 
+    # --- J-boxes (Solar rows 25/26): per-plane strings -> JB-1.2 (shingle) / JB-3 (else + ground) ---
+    _run_block("jboxes", flags, solar_rows, lambda: _jbox_block(planset))
+
     # --- Blocks still NOT auto-fed by the v2 extractor: flag, do NOT guess ---
     flags += _missing_input_flags(planset)
 
@@ -278,6 +281,39 @@ def _racking_block(planset):
     return rows, flags, overrides
 
 
+def _jbox_block(planset):
+    """J-boxes (Solar rows 25/26) from planset.jboxes: per-plane string counts + roof type.
+    qty = sum over planes of max(1, ceil(strings_on_plane / 4)); SKU row 25 (JB-1.2) for asphalt
+    shingle, row 26 (JB-3) for every other roof type and ground. Cross-checks the computed total
+    against the drawn JB count (NOTE on disagreement). Flags — never guesses — if the per-plane
+    string assignment couldn't be resolved."""
+    jb = getattr(planset, "jboxes", None) or {}
+    rows: dict[int, int] = {}
+    flags: list = []
+    planes = jb.get("planes")
+    if not planes:
+        flags.append({"level": "HARD", "item": "jbox_strings_unresolved",
+                      "msg": f"J-box count not computed — per-plane string assignment could not be "
+                             f"resolved ({jb.get('unresolved') or 'no string map read'}). Add the J-box "
+                             f"line (rows 25/26) manually from the string map."})
+        return rows, flags
+    row, total = re_eng.f_jboxes(planes, jb.get("roof_type"))
+    rows[row] = total
+    drawn = jb.get("drawn_jbox_count")
+    sku = "JB-1.2 (row 25)" if row == 25 else "JB-3 (row 26)"
+    if isinstance(drawn, int) and drawn > 0 and drawn != total:
+        flags.append({"level": "NOTE", "item": "jbox_count_vs_drawn",
+                      "msg": f"J-box count computed {total} ({sku}) from per-plane strings "
+                             f"{[p.get('strings') for p in planes]}, but the plan draws {drawn} JB(s). "
+                             f"Verify the string-per-plane read."})
+    else:
+        flags.append({"level": "NOTE", "item": "jbox_count",
+                      "msg": f"J-boxes: {total}x {sku} from per-plane strings "
+                             f"{[p.get('strings') for p in planes]} (roof_type={jb.get('roof_type')}; "
+                             f"{jb.get('source')}). Drawn JB cross-check: {drawn}."})
+    return rows, flags
+
+
 def _missing_input_flags(planset) -> list[dict]:
     """Explicit NOTE flags for every block whose structured inputs the v2 extractor does not surface,
     so a reviewer sees exactly what was NOT auto-populated (no silent gaps). Each names the field the
@@ -285,7 +321,6 @@ def _missing_input_flags(planset) -> list[dict]:
     # PV-5 electrical (disconnects, breakers, meter, MSP, taps, gateway) is now wired in _build_blocks.
     # These remain unwired pending their own extractor enrichment:
     needed = [
-        ("jboxes", "strings-per-array split by roof type (shingle/rail/metal/ground)"),
         ("micro_accessories", "microinverter SKU + branch-circuit count (Enphase Engage/combiner rows)"),
         ("homeline_msp_breaker", "a NEW Homeline MSP interconnection breaker (row-128 fallback) — "
                                  "deferred: its special-order format writes distinct B/C and needs a "
@@ -411,5 +446,6 @@ def build_bom(planset_pdf_path: str, coperniq_project_dict: dict,
         },
         "racking": {k: v for k, v in (getattr(planset, "racking", None) or {}).items()
                     if k != "raw_rows"},
+        "jboxes": getattr(planset, "jboxes", None) or {},
     }
     return data, confidence
