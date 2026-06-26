@@ -275,19 +275,28 @@ class PlansetExtractor:
             "messages": [{"role": "user", "content": content}],
         }
 
-        # Retry transient connection corruption (e.g. SSLV3_ALERT_BAD_RECORD_MAC). Extraction makes
-        # ~4 sequential Vision calls; one flaky connection should not fail the whole run. 4 attempts,
-        # exponential backoff 1s/2s/4s, re-raise only on the final attempt.
+        # Retry transient connection corruption (e.g. SSLV3_ALERT_BAD_RECORD_MAC) AND transient server
+        # overload (429 rate-limit, 500/503/529 overloaded). The per-plane orientation pass makes ~13
+        # sequential Vision calls, so a single transient overload must not fail the whole read. 4
+        # attempts, exponential backoff 1s/2s/4s, re-raise only on the final attempt.
         retryable = (ssl.SSLError, httpx.TransportError, httpx.ConnectError, httpx.ReadError)
+        retry_status = {429, 500, 502, 503, 529}
         for attempt in range(4):
             try:
                 async with httpx.AsyncClient() as client:
                     response = await client.post(
                         CLAUDE_API_URL, headers=self.headers, json=payload, timeout=60,
                     )
+                    if response.status_code in retry_status and attempt < 3:
+                        raise httpx.HTTPStatusError(f"retryable {response.status_code}",
+                                                    request=response.request, response=response)
                     response.raise_for_status()
                     return response.json()["content"][0]["text"]
-            except retryable as e:
+            except (*retryable, httpx.HTTPStatusError) as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                # only retry connection errors or the transient statuses; re-raise other HTTP errors
+                if not isinstance(e, retryable) and status not in retry_status:
+                    raise
                 if attempt == 3:
                     raise
                 delay = 2 ** attempt  # 1s, 2s, 4s
@@ -467,6 +476,160 @@ class PlansetExtractor:
             a = int(m.group(1))
             if a not in out:
                 out.append(a)
+        return out
+
+    # ---------- Module dimensions (PV-3) — close the Sirius-fallback gap ----------
+    # Expected long/short edge (in) by module-model family, for the cross-check vs the PV-3 read
+    # (user: Sirius/Hyundai/LONGi ~67.8x44.65; Aptos DNA-120 74.9x44.6). Delivered value is ALWAYS the
+    # PV-3 read; this table only drives a NOTE on disagreement.
+    _MODULE_DIMS_BY_SKU = [
+        (("ELNSM54M", "SIRIUS"), (67.80, 44.65)),
+        (("HIS-T440", "HYUNDAI"), (67.80, 44.65)),
+        (("LR5-54", "LONGI"), (67.80, 44.65)),
+        (("DNA-120", "APTOS"), (74.90, 44.60)),
+    ]
+
+    def _module_dims_sku_check(self, model: str, long_in, short_in):
+        """NOTE-level cross-check of the PV-3 dims against the SKU->dims table. Never overrides PV-3."""
+        M = (model or "").upper()
+        for keys, (elong, eshort) in self._MODULE_DIMS_BY_SKU:
+            if any(k in M for k in keys):
+                ok = abs(long_in - elong) <= 1.0 and abs(short_in - eshort) <= 1.0
+                return {"matched_family": keys[0], "expected": [elong, eshort],
+                        "pv3": [long_in, short_in], "agrees": ok}
+        return {"matched_family": None, "pv3": [long_in, short_in],
+                "note": "module model not in the SKU->dims table; delivered PV-3 value unchecked"}
+
+    def _extract_module_dims(self, pdf_path: str, pv3_page: Optional[int], model: str = "") -> dict:
+        """Read the module long/short edge from PV-3 'MODULE DIMENSIONS = L\" x W\"' (text block), and
+        CONFIRM it against the dimensioned-graphic callouts (the same two NN.NN\" tokens drawn on the
+        module graphic). Returns {long_in, short_in, source, block, graphic_confirmed, sku_check, flag}.
+        flag is a HARD dict if PV-3 is unreadable — NO silent Sirius fallback (user, Woroszylo)."""
+        out = {"long_in": None, "short_in": None, "source": None, "block": None,
+               "graphic_confirmed": False, "sku_check": None, "flag": None}
+        txt = self._page_text(pdf_path, pv3_page) if pv3_page is not None else ""
+        m = re.search(r'MODULE\s+DIMENSIONS\s*=\s*(\d{2,3}\.\d+)\s*"?\s*[xX]\s*(\d{2,3}\.\d+)', txt.upper())
+        if not m:
+            out["flag"] = {"level": "HARD", "item": "module_dims_unreadable",
+                           "msg": "PV-3 'MODULE DIMENSIONS = L\" x W\"' block not found — module dims "
+                                  "could not be read. Racking rail/splice spans use these; NO silent "
+                                  "Sirius default. Read the dims off PV-3 and verify."}
+            return out
+        a, b = float(m.group(1)), float(m.group(2))
+        long_in, short_in = max(a, b), min(a, b)
+        toks = [float(t) for t in re.findall(r'(\d{2,3}\.\d+)\s*"', txt)]
+        cnt = lambda v: sum(1 for t in toks if abs(t - v) < 0.01)
+        out.update(long_in=long_in, short_in=short_in,
+                   source="PV-3 MODULE DIMENSIONS block", block=f'{a}" x {b}"',
+                   graphic_confirmed=(cnt(a) >= 2 and cnt(b) >= 2),   # block + standalone graphic callout
+                   sku_check=self._module_dims_sku_check(model, long_in, short_in))
+        return out
+
+    # ---------- Per-plane spatial scaffolding (locate -> rotate-to-south -> multi-read) ----------
+    def _render_page_pil(self, pdf_path: str, page_index: int, zoom: float = 4.0):
+        from PIL import Image
+        doc = fitz.open(pdf_path)
+        try:
+            pix = doc[page_index].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+        finally:
+            doc.close()
+        return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+    @staticmethod
+    def _pil_b64(img) -> str:
+        import io
+        b = io.BytesIO()
+        img.save(b, format="PNG")
+        return base64.standard_b64encode(b.getvalue()).decode("utf-8")
+
+    async def _locate_planes(self, page_img) -> list:
+        """Vision: normalized (0..1) bbox of each roof plane's MODULE block on the roof plan."""
+        prompt = (
+            "This is a Tron Solar ROOF PLAN with multiple roof planes (Roof #1, #2, ...), each a block "
+            "of solar modules. Return ONLY JSON: "
+            '{"planes":[{"label":"Roof #1","bbox":[x0,y0,x1,y1]}]} where bbox is the NORMALIZED (0..1) '
+            "bounding box of that plane's MODULE block (top-left x0,y0; bottom-right x1,y1). Include "
+            "every distinct roof plane with modules; EXCLUDE legend / title block / equipment.")
+        raw = await self._call_claude([self._pil_b64(page_img)], prompt)
+        try:
+            return self._parse_json(raw).get("planes", []) or []
+        except (ValueError, json.JSONDecodeError):
+            return []
+
+    def _rotated_plane_crop(self, page_img, bbox, azimuth):
+        """Crop the plane region and rotate to south (pil_angle = azimuth-180). Reuses the engine's
+        rotate_to_south so the read is structurally tied to a south-normalized raster."""
+        from PIL import Image
+        from .racking_engine import rotate_to_south
+        W, H = page_img.size
+        x0, y0, x1, y1 = bbox
+        px, py = 0.04 * W, 0.04 * H
+        box = (max(0, int(x0 * W - px)), max(0, int(y0 * H - py)),
+               min(W, int(x1 * W + px)), min(H, int(y1 * H + py)))
+        crop = page_img.crop(box)
+        if max(crop.size) < 900:
+            s = 900 / max(crop.size)
+            crop = crop.resize((int(crop.width * s), int(crop.height * s)), Image.LANCZOS)
+        rot = rotate_to_south(crop, azimuth)
+        return rot.img
+
+    async def _read_plane_orientation(self, plane_img) -> dict:
+        """One Vision read of a south-rotated plane crop: module orientation (aspect ratio) + row count.
+        Orientation is per-module aspect (NOT cross-plane color tracing), so plane-overlap doesn't
+        corrupt it the way it did strings."""
+        prompt = (
+            "This is a cropped, SOUTH-ROTATED view of ONE roof plane of solar modules; the mounting "
+            "rails run HORIZONTALLY. Judge the MODULE orientation from each module's aspect ratio in "
+            "THIS frame: 'landscape' = the module's LONG edge is horizontal (wider than tall); "
+            "'portrait' = the long edge is vertical (taller than wide). Also count the number of "
+            "horizontal rows (horizontal rail runs of modules). Return ONLY JSON: "
+            '{"orientation":"landscape" or "portrait","rows":<integer>}.')
+        raw = await self._call_claude([self._pil_b64(plane_img)], prompt)
+        try:
+            d = self._parse_json(raw)
+            o = str(d.get("orientation", "")).lower()
+            return {"orientation": o if o in ("landscape", "portrait") else None,
+                    "rows": int(d["rows"]) if isinstance(d.get("rows"), int) else None}
+        except (ValueError, json.JSONDecodeError, TypeError):
+            return {"orientation": None, "rows": None}
+
+    async def _multi_read_orientation(self, plane_img, n: int = 3) -> dict:
+        """Run the orientation read n times; reconcile (mode) + variance. Read-agreement is reported but
+        is NOT the confidence gate — the independent ground truth is the planset attach/rail/combo
+        cross-check (run downstream in resolve_racking)."""
+        from collections import Counter
+        reads = [await self._read_plane_orientation(plane_img) for _ in range(n)]
+        oris = [r["orientation"] for r in reads if r["orientation"]]
+        rows = [r["rows"] for r in reads if isinstance(r["rows"], int)]
+        ori = Counter(oris).most_common(1)[0][0] if oris else None
+        row = Counter(rows).most_common(1)[0][0] if rows else None
+        return {"reads": reads,
+                "orientation": ori, "orientation_agree": f"{oris.count(ori)}/{len(oris)}" if oris else "0/0",
+                "rows": row, "rows_variance": (max(rows) - min(rows)) if rows else None}
+
+    async def _extract_orientation(self, pdf_path: str, pv3_page: Optional[int], arrays: list,
+                                   mount_type: str) -> dict:
+        """ROOF only, CROSS-CHECK pass: per plane, rotate the roof-plan crop to south and multi-read
+        module orientation + row count. Returns {planes:[{label,azimuth,modules,orientation,rows,
+        orientation_agree,rows_variance,reads}]}. The orchestrator turns these into make_row() arrays
+        and validates them against the planset attach/rail/combo via resolve_racking."""
+        out = {"planes": [], "note": None}
+        if mount_type != "roof" or pv3_page is None or not arrays:
+            out["note"] = f"orientation read skipped (mount={mount_type}, arrays={len(arrays or [])})"
+            return out
+        az_by = {f"Roof #{i}": a.get("azimuth") for i, a in enumerate(arrays, 1)}
+        mod_by = {f"Roof #{i}": a.get("module_count") for i, a in enumerate(arrays, 1)}
+        page_img = self._render_page_pil(pdf_path, pv3_page, zoom=4.0)
+        located = await self._locate_planes(page_img)
+        for p in located:
+            label = p.get("label", "?")
+            bbox, az = p.get("bbox"), az_by.get(p.get("label"))
+            if bbox is None or az is None:
+                continue
+            crop = self._rotated_plane_crop(page_img, bbox, az)
+            mr = await self._multi_read_orientation(crop)
+            out["planes"].append({"label": label, "azimuth": az, "modules": mod_by.get(label),
+                                  **mr})
         return out
 
     # ---------- Racking BOM table (PV-3 / PV-3.x) ----------
@@ -1202,6 +1365,20 @@ class PlansetExtractor:
         except Exception as e:  # noqa: BLE001 — never fail the whole run on the racking read
             racking = {"format": "absent", "unresolved": [f"racking extraction error: {e}"]}
             warnings.append(f"racking table extraction failed: {e}")
+
+        # Module dims from PV-3 (closes the Sirius-fallback gap) + per-plane ORIENTATION cross-check
+        # read (roof only). Both feed the orchestrator's resolve_racking cross-check pass.
+        try:
+            racking["module_dims"] = self._extract_module_dims(pdf_path, pv3_page,
+                                                               cover_data.get("module_model") or "")
+        except Exception as e:  # noqa: BLE001
+            racking["module_dims"] = {"flag": {"level": "HARD", "item": "module_dims_unreadable",
+                                               "msg": f"module dims read error: {e}"}}
+        try:
+            racking["orientation"] = await self._extract_orientation(
+                pdf_path, pv3_page, array_data.get("arrays") or [], mount_type)
+        except Exception as e:  # noqa: BLE001 — orientation is a cross-check; never fail the run
+            racking["orientation"] = {"planes": [], "note": f"orientation read error: {e}"}
 
         # --- Step 6: J-boxes (Solar rows 25/26). Strings-per-plane TEXT-FIRST (STRING #n labels +
         # module counts on the routed stringing page), Vision string-map result as fallback. Roof type

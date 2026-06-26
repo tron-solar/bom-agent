@@ -186,6 +186,107 @@ def _build_blocks(planset, project: dict):
     return solar_rows, elec_rows, solar_special, elec_special, flags
 
 
+def _racking_orientation_crosscheck(rk):
+    """CROSS-CHECK ONLY (roof): turn the per-plane orientation read into make_row() arrays and run
+    resolve_racking against the planset attach/rail/combo — the INDEPENDENT ground truth (NOT read
+    agreement). Returns flags surfacing the PV-3 module-dims + SKU check, the attachment
+    orientation-signal, the end_clamps/4 segmentation check, and resolve_racking's tolerance
+    crosschecks. NEVER changes delivered rows; NEVER raises (gate/erros -> NOTE)."""
+    flags = []
+    roof = rk.get("roof") or {}
+    md_info = rk.get("module_dims") or {}
+    ori = rk.get("orientation") or {}
+
+    # --- module dims: deliver the PV-3 value; HARD if unreadable (no silent Sirius); NOTE the SKU check
+    if md_info.get("flag"):
+        flags.append(md_info["flag"])
+        md = re_eng.ModuleDims.sirius_default()
+    elif md_info.get("long_in"):
+        md = re_eng.ModuleDims.from_pv3(md_info["long_in"], md_info["short_in"])
+        sku = md_info.get("sku_check") or {}
+        if sku.get("matched_family") and not sku.get("agrees"):
+            flags.append({"level": "NOTE", "item": "module_dims_sku_mismatch",
+                          "msg": f"PV-3 module dims {sku.get('pv3')} disagree with the "
+                                 f"{sku.get('matched_family')} SKU table {sku.get('expected')}; delivered "
+                                 f"the PV-3 value. Verify the module model / dims."})
+        else:
+            flags.append({"level": "NOTE", "item": "module_dims",
+                          "msg": f"Module dims {md.long_in}x{md.short_in} from PV-3 "
+                                 f"(graphic_confirmed={md_info.get('graphic_confirmed')}; "
+                                 f"sku_check={sku})."})
+    else:
+        md = re_eng.ModuleDims.sirius_default()
+
+    planes = ori.get("planes") or []
+    if not planes:
+        flags.append({"level": "NOTE", "item": "racking_orientation_unavailable",
+                      "msg": f"Per-plane orientation read unavailable ({ori.get('note')}); attachment/"
+                             f"rail orientation cross-check not run. Planset racking delivered as-is."})
+        return flags
+
+    # --- build make_row() arrays from the reconciled per-plane orientation + row count
+    arrays, skipped = [], []
+    for p in planes:
+        o, rws, mods, az = p.get("orientation"), p.get("rows"), p.get("modules"), p.get("azimuth")
+        if o not in ("landscape", "portrait") or not isinstance(rws, int) or rws < 1 or not mods:
+            skipped.append(p.get("label"))
+            continue
+        rws = min(rws, int(mods))                              # can't have more rows than modules
+        edge = md.long_in if o == "landscape" else md.short_in
+        base, extra = divmod(int(mods), rws)
+        row_objs = []
+        for i in range(rws):
+            n = base + (1 if i < extra else 0)
+            if n > 0:
+                row_objs.append(re_eng.make_row(n, o, round(n * edge, 1), from_rotated_raster=True,
+                                                long_in=md.long_in, short_in=md.short_in))
+        arrays.append({"label": p.get("label"), "azimuth": az, "rows": row_objs})
+    if skipped:
+        flags.append({"level": "NOTE", "item": "racking_orientation_plane_skipped",
+                      "msg": f"Orientation read incomplete for plane(s) {skipped}; excluded from the "
+                             f"cross-check."})
+    if not arrays:
+        flags.append({"level": "NOTE", "item": "racking_orientation_unavailable",
+                      "msg": "No plane produced a usable orientation read; cross-check not run."})
+        return flags
+
+    planset_dict = {"attachments": roof.get("attachments"), "rails": roof.get("rails"),
+                    "splice": roof.get("splice"), "mid_clamps": roof.get("mid_clamps") or 0,
+                    "end_clamps": roof.get("end_clamps")}
+    if any(planset_dict[k] is None for k in ("attachments", "rails", "end_clamps")):
+        flags.append({"level": "NOTE", "item": "racking_orientation_no_planset_truth",
+                      "msg": f"Planset attach/rails/end-clamps incomplete {planset_dict}; the orientation "
+                             f"cross-check needs them as ground truth — skipped."})
+        return flags
+    try:
+        _, cc = re_eng.resolve_racking(arrays, planset_dict, enforce_orientation_gate=True,
+                                       attachment_type="K2_SHINGLE", module_dims=md)
+    except Exception as e:  # noqa: BLE001 — gate/runtime error must not lose the delivered rows
+        flags.append({"level": "NOTE", "item": "racking_orientation_gate",
+                      "msg": f"Orientation cross-check could not run ({type(e).__name__}: {e}). Planset "
+                             f"quantities still delivered. Per-plane reads: "
+                             f"{[(p.get('label'), p.get('orientation'), p.get('rows')) for p in planes]}"})
+        return flags
+
+    ac = cc["attachments"]
+    per_plane = [(p.get('label'), p.get('orientation'), p.get('rows'),
+                  p.get('orientation_agree'), p.get('rows_variance')) for p in planes]
+    delta = ac['delta']
+    corroborated = -3 <= delta <= 2     # same band as racking_crosscheck; clean attach match = corroborated
+    flags.append({"level": "NOTE", "item": "racking_orientation_crosscheck",
+                  "msg": (f"Orientation cross-check ({'CORROBORATED' if corroborated else 'NOT corroborated'}): "
+                          f"attachments planset={ac['planset']} formula={ac['computed']} (delta {delta:+d}, "
+                          f"band -3..+2). per-plane {per_plane}; dims {md.long_in}x{md.short_in}. "
+                          f"{ac.get('orientation_signal')}")})
+    # CROSS-CHECK-ONLY: planset quantities are delivered as truth, so resolve_racking's tolerance +
+    # segmentation flags are ADVISORY signals about the orientation/row READ — surface them as NOTEs,
+    # never as a HARD hold on a planset-truth BOM. (They carry their original level in the message.)
+    for f in cc.get("tolerance_flags", []):
+        flags.append({"level": "NOTE", "item": f"racking_xcheck:{f.get('item')}",
+                      "msg": f"[orientation cross-check, advisory — original {f.get('level')}] {f.get('msg')}"})
+    return flags
+
+
 def _racking_block(planset):
     """Solar racking BOM (rows 33-90) from the extractor's planset.racking table. Routes by attachment
     type: K2 ground -> racking_engine.k2_ground_mount (rows 73-90); K2 shingle -> roof rows 33-52 with
@@ -267,10 +368,7 @@ def _racking_block(planset):
             flags.append({"level": "HARD", "item": "racking_table_incomplete",
                           "msg": f"Roof racking table read from {rk.get('source')} but missing fields "
                                  f"{missing}. Those rows were not populated — verify the PV-3 BOM table."})
-        flags.append({"level": "NOTE", "item": "racking_orientation_crosschecks_deferred",
-                      "msg": "Roof racking quantities delivered from the planset BOM table (authoritative). "
-                             "Orientation-based formula cross-checks (attachment/rail validation) are "
-                             "deferred to the per-array orientation sub-part."})
+        flags += _racking_orientation_crosscheck(rk)
         return rows, flags, overrides
 
     # --- S-5! metal / unrecognized — read but not auto-routed (don't guess) ---
