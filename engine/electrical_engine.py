@@ -174,6 +174,16 @@ def rsd_device(battery_count, one_line_notes_force=None):
     return ({19: qty} if qty else {}), []
 
 
+# ---------- Tesla MCI-2 RSD modules (Solar row 20) ----------
+
+def solar_mci(count):
+    """Tesla MCI-2 (RSD) count -> Solar row 20 (TSL-MCI-GEN2 / 1879359). The count is READ from the
+    planset (PV-3 BOM = truth, PV-1 SCOPE = cross-check, reconciled in the extractor) — NEVER derived
+    from module count. 0/None -> no line."""
+    c = int(count or 0)
+    return ({20: c} if c > 0 else {}), []
+
+
 # ---------- Ground bar (row 22) — GATEWAY ONLY ----------
 
 def ground_bar(gateway_count):

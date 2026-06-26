@@ -438,6 +438,27 @@ class PlansetExtractor:
         return out
 
     @staticmethod
+    def _parse_mci_count(text: str):
+        """Tesla MCI-2 (RSD) count printed on a sheet, in either planset format:
+          BOM-table triple : 'MCI's' / '20' / 'TESLA: RSD MCI-2'  (qty line between label and desc)
+          scope/callout    : '20 TESLA: RSD MCI-2' / '(12) TESLA: RSD MCI-2 LOCATED UNDER EVERY 3RD MODULE'
+        Returns the int count or None. The printed number is authoritative — NEVER derive it from the
+        module count ('every 3rd module' is descriptive, not a formula)."""
+        if not text:
+            return None
+        lines = [l.strip() for l in text.splitlines()]
+        # BOM-table triple: an integer-only line whose adjacent label/desc names the MCI equipment
+        for j, l in enumerate(lines):
+            if re.fullmatch(r"0*\d{1,4}", l):
+                prev = lines[j - 1].upper() if j > 0 else ""
+                nxt = lines[j + 1].upper() if j + 1 < len(lines) else ""
+                if "MCI" in prev or ("MCI" in nxt and ("RSD" in nxt or "TESLA" in nxt)):
+                    return int(l)
+        # inline / scope callout: a number (optional parens) immediately before 'TESLA ... RSD MCI'
+        m = re.search(r"\(?\s*0*(\d+)\s*\)?\s*TESLA\s*:?\s*RSD\s*MCI", text.upper())
+        return int(m.group(1)) if m else None
+
+    @staticmethod
     def _extract_harness_code(text: str) -> Optional[str]:
         """Find the Tesla expansion harness length code in free text. Matches '1875157-05-X',
         '1875157 05', etc. (optional spaces/hyphens, case-insensitive). Returns '05'|'20'|'40' or None."""
@@ -1421,6 +1442,34 @@ class PlansetExtractor:
         except Exception as e:  # noqa: BLE001 — never fail the whole run on the J-box read
             jboxes = {"planes": None, "unresolved": f"jbox extraction error: {e}"}
             warnings.append(f"jbox extraction failed: {e}")
+
+        # --- Step 6.5: Tesla MCI-2 (RSD) count -> Solar row 20. The PV-3 BOM/equipment count is TRUTH;
+        # the PV-1 SCOPE count is the cross-check. Conflict -> deliver PV-3 + HARD mci_count_conflict;
+        # single source -> deliver + NOTE which. (Read the printed number; never derive from modules.) ---
+        mci_pv3 = self._parse_mci_count(self._page_text(pdf_path, pv3_page)) if pv3_page is not None else None
+        mci_pv1 = self._parse_mci_count(self._page_text(pdf_path, 0))
+        mci = mci_pv3 if mci_pv3 is not None else mci_pv1
+        electrical_data["mci2_count"] = mci
+        electrical_data["mci2_count_sources"] = {"pv3_bom": mci_pv3, "pv1_scope": mci_pv1}
+        if mci_pv3 is not None and mci_pv1 is not None and mci_pv3 != mci_pv1:
+            extraction_flags.append({
+                "level": "HARD", "item": "mci_count_conflict",
+                "msg": f"Tesla MCI-2 count differs: PV-3 BOM={mci_pv3}, PV-1 SCOPE={mci_pv1}. Delivered "
+                       f"PV-3 ({mci_pv3}) as truth; verify which is correct."})
+        elif mci is not None:
+            if mci_pv3 is not None and mci_pv1 is not None:
+                extraction_flags.append({
+                    "level": "NOTE", "item": "mci_count",
+                    "msg": f"Tesla MCI-2 = {mci} (PV-3 BOM and PV-1 SCOPE agree)."})
+            else:
+                only = "PV-3 BOM" if mci_pv3 is not None else "PV-1 SCOPE"
+                extraction_flags.append({
+                    "level": "NOTE", "item": "mci_count",
+                    "msg": f"Tesla MCI-2 = {mci} (only {only} present; other source not found)."})
+        else:
+            extraction_flags.append({
+                "level": "NOTE", "item": "mci_count_not_read",
+                "msg": "Tesla MCI-2 count not found on PV-3 BOM or PV-1 SCOPE; Solar row 20 left blank — verify."})
 
         # --- Merge and return ---
         planset = self._merge(cover_data, electrical_data, array_data,

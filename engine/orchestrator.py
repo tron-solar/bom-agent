@@ -107,6 +107,11 @@ def _build_blocks(planset, project: dict):
                              "breakers, meter, and MSP could not be auto-populated — build the "
                              "Electrical sheet manually and verify against PV-5."})
 
+    # Tesla MCI-2 RSD modules (SOLAR row 20) — count read from PV-3 BOM (truth) / PV-1 scope (xcheck)
+    # in the extractor; conflict already flagged there. Never derived from module count.
+    if elec.get("mci2_count"):
+        _run_block("solar_mci", flags, solar_rows, lambda: ee.solar_mci(elec.get("mci2_count")))
+
     if elec.get("ac_disconnects"):                 # rows 5-12 + hubs 13-15 + fuses 130-144
         _run_block("ac_disconnects", flags, elec_rows, lambda: ee.ac_disconnects(elec["ac_disconnects"]))
     if elec.get("dc_disconnects"):                 # rows 17-18 by pole count
@@ -557,6 +562,8 @@ def build_bom(planset_pdf_path: str, coperniq_project_dict: dict,
             "csr_breakers": el.get("csr_breakers"),
             "csr_vision": el.get("csr_vision"),
             "csr_note_check": el.get("csr_note_check"),
+            "mci2_count": el.get("mci2_count"),
+            "mci2_count_sources": el.get("mci2_count_sources"),
             "one_line_text": el.get("one_line_text"),
         },
         "racking": {k: v for k, v in (getattr(planset, "racking", None) or {}).items()
