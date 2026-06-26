@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import os
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -102,4 +103,18 @@ def serve_file(token: str, name: str):
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "shadow_mode": CONFIG.shadow_mode}
+    # Readiness for live DRAFT posting — booleans + non-secret values only (never key values), so this
+    # can be curled against the deployed service to verify Railway env without leaking secrets.
+    pub = CONFIG.public_base_url
+    return {
+        "ok": True,
+        "shadow_mode": CONFIG.shadow_mode,
+        "public_base_url": pub,
+        "public_base_url_has_https": pub.startswith("https://"),  # MUST be True for working file links
+        "has_anthropic_key": bool(CONFIG.anthropic_api_key),
+        "has_coperniq_key": bool(CONFIG.coperniq_api_key),
+        "has_webhook_secret": bool(CONFIG.coperniq_webhook_secret),
+        "claude_model": os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6 (default)"),
+        "create_bom_task_key": CONFIG.create_bom_task_key,
+        "file_storage_dir": CONFIG.file_storage_dir,
+    }

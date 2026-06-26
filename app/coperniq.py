@@ -121,6 +121,36 @@ class CoperniqClient:
             r.raise_for_status()
             return r.json()
 
+    def list_project_comments(self, project_id: str) -> list[dict]:
+        """GET /v1/projects/{id}/comments -> list of {id, comment (HTML), createdByUser, createdAt}.
+        Used by the comment-trigger poller (Coperniq has no comment webhook)."""
+        with httpx.Client(timeout=self.timeout) as c:
+            r = c.get(f"{self.base}/projects/{project_id}/comments", headers=self._headers())
+            r.raise_for_status()
+            data = r.json()
+        return data.get("comments", data) if isinstance(data, dict) else data
+
+    def list_projects(self, updated_after: str | None = None, page_size: int = 100,
+                      max_pages: int = 50) -> list[dict]:
+        """GET /v1/projects (paged). Optional updated_after (ISO) to bound to recently-touched
+        projects. Used by the comment-trigger poller's recent-projects fallback scan source."""
+        out: list[dict] = []
+        with httpx.Client(timeout=self.timeout) as c:
+            for pg in range(1, max_pages + 1):
+                params: dict[str, Any] = {"page": pg, "page_size": page_size}
+                if updated_after:
+                    params["updated_after"] = updated_after
+                r = c.get(f"{self.base}/projects", headers=self._headers(), params=params)
+                r.raise_for_status()
+                data = r.json()
+                items = data if isinstance(data, list) else data.get("data", data.get("items", []))
+                if not items:
+                    break
+                out.extend(items)
+                if len(items) < page_size:
+                    break
+        return out
+
     def update_project_work_order(self, project_id: str, work_order_id: Any, **fields) -> dict:
         with httpx.Client(timeout=self.timeout) as c:
             r = c.patch(f"{self.base}/projects/{project_id}/work-orders/{work_order_id}",
