@@ -396,14 +396,27 @@ def _jbox_block(planset):
     drawn_vision = jb.get("drawn_jbox_count_vision")
     planes = jb.get("planes")
     if not planes:
+        # Inverter-grouped: per-plane string count isn't in the text. Populate the PROVABLE FLOOR so the
+        # section is never blank: max(plane_count, ceil(total_strings/4)) — one J-box per plane minimum,
+        # and at least ceil(strings/4) overall. This is a guaranteed lower bound (the true count is only
+        # higher if some single plane carries >4 strings). Sourced ONLY from plane_count + total_strings
+        # — NEVER from drawn/Vision counts. Keep the HARD flag so a human verifies the upper end.
+        import math as _math
+        plane_count = jb.get("plane_count") or 0
+        total_strings = jb.get("total_strings") or 0
+        roof_type = jb.get("roof_type")
+        row = 25 if roof_type == "shingle" else 26
+        floor = max(int(plane_count), _math.ceil(total_strings / 4) if total_strings else 0)
+        sku = "JB-1.2 (row 25)" if row == 25 else "JB-3 (row 26)"
+        if floor >= 1:
+            rows[row] = floor
         flags.append({"level": "HARD", "item": "jbox_per_plane_unresolved",
-                      "msg": f"J-box count NOT computed — {jb.get('unresolved') or 'string map not read'} "
-                             f"Inputs (information only, no number guessed): plane_count="
-                             f"{jb.get('plane_count')}, total_strings={jb.get('total_strings')}, "
-                             f"string_numbers={jb.get('string_numbers')}, "
-                             f"string_modules={jb.get('string_modules')}, drawn JB tokens(text)="
-                             f"{drawn_text}, drawn(Vision)={drawn_vision}. Resolve rows 25/26 by hand "
-                             f"from the string map (strings group by inverter, not by plane)."})
+                      "msg": f"J-box per-plane string count not in the text ({jb.get('unresolved') or 'string map not read'}). "
+                             f"Delivered LOWER BOUND {floor}x {sku} (>=1/plane over {plane_count} planes, "
+                             f">=ceil({total_strings} strings/4)); actual may be higher if a plane carries "
+                             f">4 strings — verify. Inputs: string_numbers={jb.get('string_numbers')}, "
+                             f"string_modules={jb.get('string_modules')}, drawn JB tokens(text)={drawn_text}, "
+                             f"drawn(Vision)={drawn_vision} (drawn counts are NOT used as the number)."})
         return rows, flags
     row, total = re_eng.f_jboxes(planes, jb.get("roof_type"))
     rows[row] = total
