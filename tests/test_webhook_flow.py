@@ -45,7 +45,11 @@ class _FakeClient:
                               create_bom_assignee=Assignee(id=11695, first_name="Ankurkumar",
                                                            last_name="Suthar", email="a@x.com"),
                               raw={"id": pid, "title": "Joseph Woroszylo",
-                                   "phase": {"instanceId": 2854306}, "address": ["305 Boyd St"]})
+                                   "phase": {"instanceId": 2854399},  # current phase (NOT Engineering)
+                                   "phaseInstances": [
+                                       {"id": 2854301, "name": "Initiation", "phaseTemplate": {"id": 2796}},
+                                       {"id": 2854306, "name": "Engineering", "phaseTemplate": {"id": 2797}}],
+                                   "address": ["305 Boyd St"]})
 
     def find_planset_file(self, pid, customer_name):
         return {"file": {"id": 1}, "url": "http://x/REVA.pdf",
@@ -94,7 +98,8 @@ def test_full_flow_attaches_and_notifies(monkeypatch):
     names = [f["name"] for f in fake.files]
     assert any(n.startswith("DRAFT — BOM_Joseph_Woroszylo") for n in names)
     assert any("confidence report" in n for n in names)
-    assert fake.files[0]["phase"] == 2854306
+    # BOTH files attach to the Engineering phase instance (2854306), NOT the current phase (2854399)
+    assert [f["phase"] for f in fake.files] == [2854306, 2854306]
     # assignee @mentioned with flag counts
     assert fake.comments and "[Ankurkumar Suthar|~id:11695]" in fake.comments[0]
     assert "1 hard / 1 soft" in fake.comments[0]

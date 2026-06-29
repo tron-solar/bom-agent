@@ -136,6 +136,27 @@ def _safe_name(project: ProjectContext) -> str:
     return "BOM_" + "_".join(base.split()) + ".xlsx"
 
 
+ENG_PHASE_TEMPLATE_ID = 2797   # phase-TEMPLATE id for "Engineering" (workflow-level, NOT a project-
+                               # specific instance id); used only as the fallback match criterion.
+
+
+def _resolve_engineering_phase_id(project_raw: dict):
+    """Resolve THIS project's Engineering phase-INSTANCE id from get_project's phaseInstances so DRAFT
+    files attach to Engineering (not the project's current phase). Primary: the instance named
+    'Engineering'. Fallback (0 or >1 name matches): the instance whose phaseTemplate.id ==
+    ENG_PHASE_TEMPLATE_ID. Returns None if neither uniquely resolves (caller HARD-flags; the file
+    still posts, to the default phase). The instance id is project-specific — never hardcoded."""
+    instances = (project_raw or {}).get("phaseInstances") or []
+    by_name = [pi for pi in instances if str(pi.get("name", "")).strip().lower() == "engineering"]
+    if len(by_name) == 1:
+        return by_name[0].get("id")
+    by_tmpl = [pi for pi in instances
+               if (pi.get("phaseTemplate") or {}).get("id") == ENG_PHASE_TEMPLATE_ID]
+    if len(by_tmpl) == 1:
+        return by_tmpl[0].get("id")
+    return None
+
+
 # ---------- notify ----------
 def notify_assignee(client: CoperniqClient, project: ProjectContext, file_name: str,
                     hard: int, soft: int) -> None:
@@ -206,17 +227,28 @@ def process(project_id: str, task_key: str) -> PipelineResult:
         except OSError:
             pass
 
+    # Resolve THIS project's Engineering phase-instance so DRAFT files land in Engineering, not the
+    # project's current phase. Unresolved -> HARD flag (file still posts, to the default phase). Done
+    # before _count_flags so the flag is counted and lands in the confidence report.
+    eng_phase_id = _resolve_engineering_phase_id(project.raw)
+    if eng_phase_id is None:
+        confidence.setdefault("FLAGS_FOR_HUMAN_REVIEW", []).append({
+            "level": "HARD", "item": "engineering_phase_unresolved",
+            "msg": f"Could not resolve this project's Engineering phase instance (no phaseInstance named "
+                   f"'Engineering', and none with phaseTemplate.id=={ENG_PHASE_TEMPLATE_ID}). DRAFT files "
+                   f"posted to the project's DEFAULT phase, not Engineering — move them manually or "
+                   f"check the project's workflow."})
+
     hard, soft = _count_flags(confidence)
     file_name = _safe_name(project)
 
-    # host the xlsx, attach as DRAFT
+    # host the xlsx, attach as DRAFT (Engineering phase)
     try:
         hosted = host_bytes(xlsx_bytes, file_name)
         stem, ext = os.path.splitext(file_name)            # ext from the real filename, not assumed
         draft_name = f"DRAFT — {stem} (auto, pending review){ext}"
-        phase_iid = (project.raw.get("phase") or {}).get("instanceId")
         client.create_project_file(project_id, url=hosted.public_url, name=draft_name,
-                                   phase_instance_id=phase_iid)
+                                   phase_instance_id=eng_phase_id)
     except Exception as e:
         log.exception("attach failed")
         notify_failure(client, project_id, mention, f"file attach: {e}")
@@ -229,7 +261,8 @@ def process(project_id: str, task_key: str) -> PipelineResult:
         conf_hosted = host_bytes(conf_bytes, conf_name)
         _, conf_ext = os.path.splitext(conf_name)          # .json, from the confidence file's own name
         client.create_project_file(project_id, url=conf_hosted.public_url,
-                                   name=f"DRAFT — confidence report ({stem}){conf_ext}")
+                                   name=f"DRAFT — confidence report ({stem}){conf_ext}",
+                                   phase_instance_id=eng_phase_id)
     except Exception:
         log.warning("confidence report attach failed (non-fatal)", exc_info=True)
 
