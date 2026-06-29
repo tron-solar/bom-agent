@@ -27,11 +27,15 @@ try:
 except Exception:
     pass
 
-for line in (ROOT / ".env").read_text(encoding="utf-8", errors="ignore").splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip())
+# .env is optional: present locally, absent on Railway (env vars injected directly). Skip silently
+# if there's no file — the real vars are already in os.environ there.
+_envfile = ROOT / ".env"
+if _envfile.exists():
+    for line in _envfile.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
 
 import logging
 logging.basicConfig(level=logging.WARNING)
