@@ -212,7 +212,8 @@ def process(project_id: str, task_key: str) -> PipelineResult:
     # host the xlsx, attach as DRAFT
     try:
         hosted = host_bytes(xlsx_bytes, file_name)
-        draft_name = f"DRAFT — {file_name[:-5]} (auto, pending review)"
+        stem, ext = os.path.splitext(file_name)            # ext from the real filename, not assumed
+        draft_name = f"DRAFT — {stem} (auto, pending review){ext}"
         phase_iid = (project.raw.get("phase") or {}).get("instanceId")
         client.create_project_file(project_id, url=hosted.public_url, name=draft_name,
                                    phase_instance_id=phase_iid)
@@ -224,9 +225,11 @@ def process(project_id: str, task_key: str) -> PipelineResult:
     # also host the confidence report (optional, attach as a companion)
     try:
         conf_bytes = json.dumps(confidence, indent=2).encode()
-        conf_hosted = host_bytes(conf_bytes, file_name.replace("BOM_", "").replace(".xlsx", "_confidence.json"))
+        conf_name = file_name.replace("BOM_", "").replace(".xlsx", "_confidence.json")
+        conf_hosted = host_bytes(conf_bytes, conf_name)
+        _, conf_ext = os.path.splitext(conf_name)          # .json, from the confidence file's own name
         client.create_project_file(project_id, url=conf_hosted.public_url,
-                                   name=f"DRAFT — confidence report ({file_name[:-5]})")
+                                   name=f"DRAFT — confidence report ({stem}){conf_ext}")
     except Exception:
         log.warning("confidence report attach failed (non-fatal)", exc_info=True)
 
