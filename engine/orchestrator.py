@@ -202,25 +202,36 @@ def _racking_orientation_crosscheck(rk):
     md_info = rk.get("module_dims") or {}
     ori = rk.get("orientation") or {}
 
-    # --- module dims: deliver the PV-3 value; HARD if unreadable (no silent Sirius); NOTE the SKU check
+    # --- module dims: deliver the PV-3 value. A reviewer-facing flag is emitted ONLY when the read is
+    # NOT fully corroborated. Fully corroborated == graphic_confirmed AND sku_check.agrees -> NO flag
+    # (a check that passed must not produce a human-review item). Gate on the engine's own booleans.
     if md_info.get("flag"):
-        flags.append(md_info["flag"])
+        flags.append(md_info["flag"])                       # HARD module_dims_unreadable (read failed)
         md = re_eng.ModuleDims.sirius_default()
     elif md_info.get("long_in"):
         md = re_eng.ModuleDims.from_pv3(md_info["long_in"], md_info["short_in"])
         sku = md_info.get("sku_check") or {}
-        if sku.get("matched_family") and not sku.get("agrees"):
+        graphic_ok = bool(md_info.get("graphic_confirmed"))
+        sku_agrees = sku.get("agrees") is True
+        if graphic_ok and sku_agrees:
+            pass                                            # fully corroborated -> emit NOTHING
+        elif sku.get("matched_family") and sku.get("agrees") is False:
             flags.append({"level": "NOTE", "item": "module_dims_sku_mismatch",
                           "msg": f"PV-3 module dims {sku.get('pv3')} disagree with the "
                                  f"{sku.get('matched_family')} SKU table {sku.get('expected')}; delivered "
                                  f"the PV-3 value. Verify the module model / dims."})
         else:
-            flags.append({"level": "NOTE", "item": "module_dims",
-                          "msg": f"Module dims {md.long_in}x{md.short_in} from PV-3 "
-                                 f"(graphic_confirmed={md_info.get('graphic_confirmed')}; "
-                                 f"sku_check={sku})."})
+            # delivered the PV-3 value but it isn't fully corroborated (graphic not confirmed and/or
+            # SKU not cross-checkable) — surface it so a human can confirm the dims.
+            flags.append({"level": "NOTE", "item": "module_dims_uncorroborated",
+                          "msg": f"Module dims {md.long_in}x{md.short_in} from PV-3 delivered but NOT "
+                                 f"fully corroborated (graphic_confirmed={graphic_ok}; sku_check={sku}). "
+                                 f"Verify the dims."})
     else:
-        md = re_eng.ModuleDims.sirius_default()
+        md = re_eng.ModuleDims.sirius_default()             # dims fell back to a default -> flag it
+        flags.append({"level": "NOTE", "item": "module_dims_defaulted",
+                      "msg": "Module dims fell back to the Sirius default (no PV-3 dims read for this "
+                             "project); verify the module dimensions."})
 
     planes = ori.get("planes") or []
     if not planes:
