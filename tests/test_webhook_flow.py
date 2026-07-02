@@ -94,12 +94,13 @@ def test_full_flow_attaches_and_notifies(monkeypatch):
     c = TestClient(main.app)
     r = c.post("/webhooks/coperniq/create-bom", json={"project_id": 857222, "task_key": "create_bom"})
     assert r.status_code == 202
-    # BOM + confidence both attached as DRAFT
+    # DRAFT xlsx + confidence JSON + confidence DOCX all attached
     names = [f["name"] for f in fake.files]
     assert any(n.startswith("DRAFT — BOM_Joseph_Woroszylo") for n in names)
-    assert any("confidence report" in n for n in names)
-    # BOTH files attach to the Engineering phase instance (2854306), NOT the current phase (2854399)
-    assert [f["phase"] for f in fake.files] == [2854306, 2854306]
+    assert any(n.endswith(").json") and "confidence report" in n for n in names)   # machine-readable JSON
+    assert any(n.endswith(").docx") and "confidence report" in n for n in names)   # human-readable Word
+    # ALL files attach to the Engineering phase instance (2854306), NOT the current phase (2854399)
+    assert [f["phase"] for f in fake.files] == [2854306, 2854306, 2854306]
     # assignee @mentioned with flag counts
     assert fake.comments and "[Ankurkumar Suthar|~id:11695]" in fake.comments[0]
     assert "1 hard / 1 soft" in fake.comments[0]

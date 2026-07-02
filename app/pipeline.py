@@ -266,6 +266,20 @@ def process(project_id: str, task_key: str) -> PipelineResult:
     except Exception:
         log.warning("confidence report attach failed (non-fatal)", exc_info=True)
 
+    # also render + attach the HUMAN-READABLE confidence report (Word). The JSON above stays the
+    # machine-readable source of truth; this .docx adds the reviewer "What to check" guidance column
+    # (doc-only). Same Engineering phase. Non-fatal: a render/attach miss must not fail the run.
+    try:
+        from engine.confidence_docx import render_confidence_docx
+        docx_bytes = render_confidence_docx(confidence)
+        docx_name = conf_name.replace("_confidence.json", "_confidence.docx")
+        docx_hosted = host_bytes(docx_bytes, docx_name)
+        client.create_project_file(project_id, url=docx_hosted.public_url,
+                                   name=f"DRAFT — confidence report ({stem}).docx",
+                                   phase_instance_id=eng_phase_id)
+    except Exception:
+        log.warning("confidence docx render/attach failed (non-fatal)", exc_info=True)
+
     # notify
     try:
         notify_assignee(client, project, draft_name, hard, soft)
