@@ -21,6 +21,7 @@ class Config:
     file_url_ttl_hours: int
     create_bom_task_key: str
     shadow_mode: bool
+    draft_mode: bool
     libreoffice_bin: str
 
     @classmethod
@@ -36,6 +37,9 @@ class Config:
             file_url_ttl_hours=int(os.environ.get("FILE_URL_TTL_HOURS", "168")),
             create_bom_task_key=os.environ.get("CREATE_BOM_TASK_KEY", "create_bom"),
             shadow_mode=_bool(os.environ.get("SHADOW_MODE"), True),
+            # draft_mode True -> attached file display names keep the "DRAFT — " prefix. Flip to False
+            # at go-live (DRAFT_MODE=0) to drop the prefix. Controls ONLY the prefix (Fixes 4-6).
+            draft_mode=_bool(os.environ.get("DRAFT_MODE"), True),
             libreoffice_bin=os.environ.get("LIBREOFFICE_BIN", "libreoffice"),
         )
 

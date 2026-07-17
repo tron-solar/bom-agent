@@ -136,6 +136,18 @@ def _safe_name(project: ProjectContext) -> str:
     return "BOM_" + "_".join(base.split()) + ".xlsx"
 
 
+def _display_base(project: ProjectContext) -> str:
+    """'BOM <Customer Name>' for the Coperniq DISPLAY name — spaces, not underscores (the served
+    filename stays underscored via _safe_name)."""
+    base = project.customer_name or f"project {project.project_id}"
+    return "BOM " + " ".join(base.split())
+
+
+def _draft_prefix() -> str:
+    """'DRAFT — ' while CONFIG.draft_mode is True (default); '' at go-live (DRAFT_MODE=0)."""
+    return "DRAFT — " if CONFIG.draft_mode else ""
+
+
 ENG_PHASE_TEMPLATE_ID = 2797   # phase-TEMPLATE id for "Engineering" (workflow-level, NOT a project-
                                # specific instance id); used only as the fallback match criterion.
 
@@ -242,11 +254,12 @@ def process(project_id: str, task_key: str) -> PipelineResult:
     hard, soft = _count_flags(confidence)
     file_name = _safe_name(project)
 
-    # host the xlsx, attach as DRAFT (Engineering phase)
+    # host the xlsx, attach (Engineering phase). Display name: "[DRAFT — ]BOM <Name> (pending review).xlsx"
+    # (spaces, no "auto,"; extension via splitext, never [:-5]). Served filename (file_name) unchanged.
     try:
         hosted = host_bytes(xlsx_bytes, file_name)
-        stem, ext = os.path.splitext(file_name)            # ext from the real filename, not assumed
-        draft_name = f"DRAFT — {stem} (auto, pending review){ext}"
+        _, ext = os.path.splitext(file_name)               # ".xlsx" from the real filename
+        draft_name = f"{_draft_prefix()}{_display_base(project)} (pending review){ext}"
         client.create_project_file(project_id, url=hosted.public_url, name=draft_name,
                                    phase_instance_id=eng_phase_id)
     except Exception as e:
@@ -254,28 +267,25 @@ def process(project_id: str, task_key: str) -> PipelineResult:
         notify_failure(client, project_id, mention, f"file attach: {e}")
         return PipelineResult("failed", f"attach failed: {e}")
 
-    # also host the confidence report (optional, attach as a companion)
+    # confidence JSON: still generated + hosted internally (machine-readable source of truth), but NO
+    # LONGER attached to Coperniq (Fix 5) — only the human-readable .docx is posted below.
     try:
         conf_bytes = json.dumps(confidence, indent=2).encode()
         conf_name = file_name.replace("BOM_", "").replace(".xlsx", "_confidence.json")
-        conf_hosted = host_bytes(conf_bytes, conf_name)
-        _, conf_ext = os.path.splitext(conf_name)          # .json, from the confidence file's own name
-        client.create_project_file(project_id, url=conf_hosted.public_url,
-                                   name=f"DRAFT — confidence report ({stem}){conf_ext}",
-                                   phase_instance_id=eng_phase_id)
+        conf_hosted = host_bytes(conf_bytes, conf_name)    # hosted for internal reference; not posted
     except Exception:
-        log.warning("confidence report attach failed (non-fatal)", exc_info=True)
+        log.warning("confidence report hosting failed (non-fatal)", exc_info=True)
 
-    # also render + attach the HUMAN-READABLE confidence report (Word). The JSON above stays the
-    # machine-readable source of truth; this .docx adds the reviewer "What to check" guidance column
-    # (doc-only). Same Engineering phase. Non-fatal: a render/attach miss must not fail the run.
+    # render + attach the HUMAN-READABLE confidence report (Word) — the one confidence artifact posted.
+    # Display: "[DRAFT — ]Confidence Report (BOM <Name>).docx". Same Engineering phase. Non-fatal.
     try:
         from engine.confidence_docx import render_confidence_docx
         docx_bytes = render_confidence_docx(confidence)
-        docx_name = conf_name.replace("_confidence.json", "_confidence.docx")
+        docx_name = file_name.replace("BOM_", "").replace(".xlsx", "_confidence.docx")
         docx_hosted = host_bytes(docx_bytes, docx_name)
+        _, docx_ext = os.path.splitext(docx_name)          # ".docx" from the file's own name
         client.create_project_file(project_id, url=docx_hosted.public_url,
-                                   name=f"DRAFT — confidence report ({stem}).docx",
+                                   name=f"{_draft_prefix()}Confidence Report ({_display_base(project)}){docx_ext}",
                                    phase_instance_id=eng_phase_id)
     except Exception:
         log.warning("confidence docx render/attach failed (non-fatal)", exc_info=True)

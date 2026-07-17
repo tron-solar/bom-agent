@@ -78,6 +78,31 @@ def _run_block(label, flags, target_rows, fn, target_special=None):
                              f"This line could not be computed — build it manually and report the error."})
 
 
+def _pw3_landing_breaker_qty(ac_disconnects, pw3_count, existing_br260):
+    """A PW3 lands on a 60A/2P breaker (BR260, Electrical row 106). When any AC disconnect is
+    NON-FUSED and PW3s are present, there must be one BR260 per PW3 — the SAME row/SKU as the bus-kit
+    60A/2P, coupled to the PW3 count. A disconnect is FUSED only if 'fuse'/'fused' appears in its read;
+    otherwise it defaults to NON-FUSED. Returns the row-106 qty to SET (== pw3_count), or None to leave
+    it unchanged — None when there is no PW3, no non-fused disconnect, or the bus-kit already provided
+    >= pw3_count BR260 (so the gateway bus-kit breakers are never double-counted)."""
+    if pw3_count <= 0:
+        return None
+
+    def _fused(d):
+        if d.get("fused") is not None:
+            return bool(d.get("fused"))
+        text = f"{d.get('type', '')} {d.get('description', '')} {d.get('label', '')}".lower()
+        if any(neg in text for neg in ("non-fused", "non fused", "nonfused", "non-fuse")):
+            return False                       # "NON-FUSED" contains "fuse" — negation wins
+        return "fuse" in text
+
+    if not any(not _fused(d) for d in (ac_disconnects or [])):
+        return None
+    if int(existing_br260 or 0) >= pw3_count:
+        return None
+    return pw3_count
+
+
 def _build_blocks(planset, project: dict):
     """Drive the engine blocks from the extracted PlansetData. Returns
     (solar_rows, electrical_rows, solar_special, electrical_special, flags).
@@ -94,6 +119,13 @@ def _build_blocks(planset, project: dict):
     # --- Module line (Solar rows 5-9) ---
     _run_block("solar_module", flags, solar_rows,
                lambda: ee.solar_module(planset.module_model, planset.module_quantity), solar_special)
+
+    # --- S-clips (Solar row 30) = module_count * 6, written as a STATIC int. The template ships A30 as
+    # '=IF(...)*6', which Coperniq's un-recalced viewer shows BLANK; writing the computed integer fixes
+    # the display without changing the x6 rule (user, Dare). ---
+    _mc = int(planset.module_quantity or 0)
+    if _mc:
+        _run_block("s_clips", flags, solar_rows, lambda: ({30: re_eng.f_s_clip(_mc)}, []))
 
     # --- RSD device (Electrical row 19) = ceil(batteries/3); PW3 expansion excluded ---
     battery_count = int(planset.battery_quantity or 0)
@@ -141,6 +173,18 @@ def _build_blocks(planset, project: dict):
         csr = [int(a) for a in (elec.get("csr_breakers") or []) if a]
         _run_block("tesla_gateway_breakers", flags, elec_rows,           # BR 98-110 / CSR 112-114
                    lambda: re_eng.tesla_gateway_breakers(buskit, csr, battery_pw3_count=pw3_count))
+
+    # PW3 landing breaker (unconditional; decides its own applicability): a NON-FUSED AC disconnect
+    # with PW3 present needs one 60A/2P (BR260, Electrical row 106) per PW3 to land on — same row/SKU
+    # as the bus-kit 60A/2P, coupled to the PW3 count, de-duped against the gateway bus-kit's BR260.
+    pw3_landing_count = len(pw3_skus) or battery_count
+    _landing = _pw3_landing_breaker_qty(elec.get("ac_disconnects") or [], pw3_landing_count,
+                                        elec_rows.get(106, 0))
+    if _landing is not None:
+        elec_rows[106] = _landing
+        flags.append({"level": "NOTE", "item": "pw3_landing_breaker",
+                      "msg": f"Non-fused AC disconnect with {pw3_landing_count} PW3 unit(s): {_landing}x "
+                             f"BR260 (60A/2P, Electrical row 106) added for the PW3 to land on."})
 
     # Tesla PW3 Expansion (rows 59 unit / 63-65 harness by -05/-20/-40 / 61 stack or 62 wall kit).
     # Mount was already resolved in the extractor (plan -> Master Note -> default wall).
@@ -396,52 +440,46 @@ def _racking_block(planset):
 
 
 def _jbox_block(planset):
-    """J-boxes (Solar rows 25/26) from planset.jboxes. qty = sum over planes of
-    max(1, ceil(strings_on_plane / 4)) — this FORMULA is the sole truth. SKU row 25 (JB-1.2) for
+    """J-boxes (Solar rows 25/26), driven by MODULES per roof plane — always computable, so this never
+    HARD-flags. qty = sum over planes of max(1, ceil(modules_on_plane / 40)); SKU row 25 (JB-1.2) for
     asphalt shingle, row 26 (JB-3) for every other roof type and ground.
 
-    The DRAWN JB count is surfaced as INFORMATION ONLY, never a validator: plansets draw J-boxes for
-    wire-type transitions ("subject to change in the field"), not per the strings-per-J-box rule, so
-    computed > drawn is EXPECTED and is not flagged. When the per-plane string count can't be resolved
-    from the text (inverter-grouped strings), HARD-flag and surface the inputs — never guess a number
-    (not from plane_count, not from the drawn count)."""
+    The string-count method (per-plane strings, ceil/4) and the drawn JB count are CORROBORATION ONLY:
+    at most a NOTE if they disagree or are unreadable — NEVER a HARD flag. (Removed the old HARD
+    'jbox_per_plane_unresolved': the module-count rule is always available, so nothing gates on it.)"""
     jb = getattr(planset, "jboxes", None) or {}
     rows: dict[int, int] = {}
     flags: list = []
-    drawn_text = jb.get("drawn_jbox_count_text")
-    drawn_vision = jb.get("drawn_jbox_count_vision")
-    planes = jb.get("planes")
-    if not planes:
-        # Inverter-grouped: per-plane string count isn't in the text. Populate the PROVABLE FLOOR so the
-        # section is never blank: max(plane_count, ceil(total_strings/4)) — one J-box per plane minimum,
-        # and at least ceil(strings/4) overall. This is a guaranteed lower bound (the true count is only
-        # higher if some single plane carries >4 strings). Sourced ONLY from plane_count + total_strings
-        # — NEVER from drawn/Vision counts. Keep the HARD flag so a human verifies the upper end.
-        import math as _math
-        plane_count = jb.get("plane_count") or 0
-        total_strings = jb.get("total_strings") or 0
-        roof_type = jb.get("roof_type")
-        row = 25 if roof_type == "shingle" else 26
-        floor = max(int(plane_count), _math.ceil(total_strings / 4) if total_strings else 0)
-        sku = "JB-1.2 (row 25)" if row == 25 else "JB-3 (row 26)"
-        if floor >= 1:
-            rows[row] = floor
-        flags.append({"level": "HARD", "item": "jbox_per_plane_unresolved",
-                      "msg": f"J-box per-plane string count not in the text ({jb.get('unresolved') or 'string map not read'}). "
-                             f"Delivered LOWER BOUND {floor}x {sku} (>=1/plane over {plane_count} planes, "
-                             f">=ceil({total_strings} strings/4)); actual may be higher if a plane carries "
-                             f">4 strings — verify. Inputs: string_numbers={jb.get('string_numbers')}, "
-                             f"string_modules={jb.get('string_modules')}, drawn JB tokens(text)={drawn_text}, "
-                             f"drawn(Vision)={drawn_vision} (drawn counts are NOT used as the number)."})
+    roof_type = jb.get("roof_type")
+    mpp = [int(m) for m in (jb.get("modules_per_plane") or []) if m]
+    if not mpp:
+        # Per-plane modules missing (PV-3 roof-description table not read) -> single-plane fallback from
+        # the project module total. Still never HARD.
+        total_mod = int(jb.get("module_total") or 0)
+        if total_mod:
+            mpp = [total_mod]
+    if not mpp:
+        flags.append({"level": "NOTE", "item": "jbox_not_computed",
+                      "msg": "No per-plane or total module count available to size J-boxes; add rows "
+                             "25/26 manually from the roof plan."})
         return rows, flags
-    row, total = re_eng.f_jboxes(planes, jb.get("roof_type"))
-    rows[row] = total
+
+    row, total = re_eng.f_jboxes_by_modules(mpp, roof_type)
+    if total >= 1:
+        rows[row] = total
     sku = "JB-1.2 (row 25)" if row == 25 else "JB-3 (row 26)"
     flags.append({"level": "NOTE", "item": "jbox_count",
-                  "msg": f"J-boxes: {total}x {sku} (formula, truth) via '{jb.get('resolution_path')}' — "
-                         f"{jb.get('source')}. Drawn JB count {drawn_text} (text) / {drawn_vision} "
-                         f"(Vision) is informational only — plansets draw J-boxes for wire-type "
-                         f"transitions, so it can be fewer than required and is NOT a cross-check."})
+                  "msg": f"J-boxes: {total}x {sku} from modules/plane {mpp} "
+                         f"(max(1, ceil(modules/40)) per plane; roof_type={roof_type})."})
+
+    # CORROBORATION ONLY (never HARD): the string-count method, if the per-plane strings resolved.
+    planes = jb.get("planes")
+    if planes:
+        _, s_total = re_eng.f_jboxes(planes, roof_type)
+        if s_total != total:
+            flags.append({"level": "NOTE", "item": "jbox_string_corroboration",
+                          "msg": f"String-count method -> {s_total} J-box(es) vs {total} by module count "
+                                 f"(delivered). Cross-check only; verify if the gap is large."})
     return rows, flags
 
 

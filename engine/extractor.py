@@ -1430,7 +1430,13 @@ class PlansetExtractor:
                 src = (f"strings don't nest into the {plane_count} plane module-counts "
                        f"(inverter-grouped); per-plane string count is not recoverable from the text "
                        f"layer (plane_count={plane_count}, total_strings={total_strings}).")
+            # PRIMARY J-box driver (always computable): modules-per-plane from the PV-3 ROOF DESCRIPTION
+            # "# OF MODULES" column (== each array's module_count). The strings result stays as a
+            # corroboration-only cross-check (NOTE, never HARD).
+            modules_per_plane = [int(a.get("module_count")) for a in arrays_list if a.get("module_count")]
             jboxes = {"roof_type": roof_type, "mount_type": mount_type, "string_page": string_page,
+                      "modules_per_plane": modules_per_plane,
+                      "module_total": int(cover_data.get("module_quantity") or 0),
                       "planes": planes, "resolution_path": path, "plane_count": plane_count,
                       "string_numbers": [n for n, _ in strings], "string_modules": [m for _, m in strings],
                       "total_strings": total_strings or string_data.get("total_strings"),
@@ -1440,7 +1446,9 @@ class PlansetExtractor:
             if planes is None:
                 jboxes["unresolved"] = src
         except Exception as e:  # noqa: BLE001 — never fail the whole run on the J-box read
-            jboxes = {"planes": None, "unresolved": f"jbox extraction error: {e}"}
+            jboxes = {"planes": None, "modules_per_plane": [],
+                      "module_total": int(cover_data.get("module_quantity") or 0),
+                      "unresolved": f"jbox extraction error: {e}"}
             warnings.append(f"jbox extraction failed: {e}")
 
         # --- Step 6.5: Tesla MCI-2 (RSD) count -> Solar row 20. The PV-3 BOM/equipment count is TRUTH;

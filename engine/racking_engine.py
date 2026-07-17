@@ -426,6 +426,22 @@ def f_jboxes(roof_planes, roof_type):
     return row, total
 
 
+JBOX_MODULES_PER_BOX = 40   # one J-box holds up to 40 modules; step up per additional 40
+
+
+def f_jboxes_by_modules(modules_per_plane, roof_type):
+    """J-boxes sized from MODULES per roof plane — always computable (no string map needed), which is
+    why this is the PRIMARY J-box rule (user).
+      per-plane jboxes = max(1, ceil(modules_on_plane / 40))   (min 1 per plane; +1 per extra 40)
+      total            = sum over planes; NO buffer.
+    roof_type: 'shingle' -> JB-1.2 (row 25); everything else roof + ground -> JB-3 (row 26).
+    modules_per_plane: e.g. Moore [16, 15] -> 1 + 1 = 2. Returns (row, total_qty)."""
+    row = 25 if roof_type == "shingle" else 26
+    total = sum(max(1, math.ceil((int(m) or 0) / JBOX_MODULES_PER_BOX))
+                for m in (modules_per_plane or []))
+    return row, total
+
+
 def f_ground_lug(arrays):            # TRUTH (formula), from BOM tool C15 under the new rows model
     """Ground lug = rows + 1.  BOM tool C15 = B6 + (B7*2); with the new model B7=0 (interrupted
     runs are separate rows), so it reduces to rows. User: ADD ONE ground lug by default to every
