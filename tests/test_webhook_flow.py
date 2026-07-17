@@ -232,9 +232,15 @@ def test_signature(monkeypatch):
     monkeypatch.setattr(main.pipeline, "CoperniqClient", lambda: fake)
     c = TestClient(main.app)
     body = json.dumps({"project_id": 5, "task_key": "create_bom"}).encode()
+    # (a-neg) UNSIGNED request with a secret set -> 401
+    unsigned = c.post("/webhooks/coperniq/create-bom", content=body,
+                      headers={"Content-Type": "application/json"})
+    assert unsigned.status_code == 401
+    # (b) WRONG signature -> 401
     bad = c.post("/webhooks/coperniq/create-bom", content=body,
                  headers={"X-Coperniq-Signature": "sha256=bad", "Content-Type": "application/json"})
     assert bad.status_code == 401
+    # (a) CORRECT HMAC-SHA256 over the raw body -> 202
     sig = hmac.new(b"topsecret", body, hashlib.sha256).hexdigest()
     good = c.post("/webhooks/coperniq/create-bom", content=body,
                   headers={"X-Coperniq-Signature": f"sha256={sig}", "Content-Type": "application/json"})
