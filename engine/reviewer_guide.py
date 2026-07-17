@@ -46,6 +46,18 @@ GUIDE: dict[str, tuple[str, str]] = {
     "mci_count": (
         "Solar BOM — row 20",
         "Confirm MCI-2 count matches the PV-3 BOM table."),
+    "ac_disconnect_count_clarified": (
+        "Electrical BOM — AC disconnect rows 5-12",
+        "AC disconnect count set from the equipment schedule (the one-line differed). Confirm the count."),
+    "dc_disconnect_count_clarified": (
+        "Electrical BOM — DC disconnect rows 17-18",
+        "DC disconnect count/poles set from the equipment schedule (the one-line differed). Confirm."),
+    "ac_disconnect_count_from_oneline": (
+        "Electrical BOM — AC disconnect rows 5-12",
+        "No equipment schedule; AC disconnect count came from the PV-5 one-line (Vision). Verify the count."),
+    "dc_disconnect_count_from_oneline": (
+        "Electrical BOM — DC disconnect rows 17-18",
+        "No equipment schedule; DC disconnect count came from the PV-5 one-line (Vision). Verify the count."),
 }
 
 

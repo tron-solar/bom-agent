@@ -459,6 +459,107 @@ class PlansetExtractor:
         return int(m.group(1)) if m else None
 
     @staticmethod
+    def _parse_disconnect_schedule(text: str):
+        """Parse AC/DC disconnect COUNT + type from an equipment/BOM schedule table (the
+        EQUIPMENT | QTY | DESCRIPTION | RATINGS layout, e.g. PV-5.1), WHEN one is present. Deterministic
+        text used to CLARIFY (correct) the count when available — the PV-5 one-line Vision read is the
+        base but over-counts disconnect symbols (Ritchason: 4 AC / 3 DC vs the schedule's 2 / 2+2). This
+        schedule is NOT on every planset and is never a required source of truth; a caller that gets
+        empty lists simply keeps the Vision read. Returns (ac_list, dc_list) expanded to ONE dict per
+        device so the existing count-by-length engine blocks yield the right qty:
+            ac: {"amp": int, "fused": bool, "fuse_amp": None}    dc: {"poles": int}
+        Empty lists if the schedule has no disconnect rows. Matches only the standalone EQUIPMENT-column
+        label lines ('AC DISCONNECT' / 'DC DISCONNECT'), never prose or a wrapped DESCRIPTION line."""
+        lines = [l.strip() for l in (text or "").splitlines()]
+        ac, dc = [], []
+        for i, l in enumerate(lines):
+            U = l.upper()
+            if U not in ("AC DISCONNECT", "DC DISCONNECT"):
+                continue
+            qty = qbase = None
+            for j in range(i + 1, min(i + 3, len(lines))):          # QTY = next integer-only line
+                if re.fullmatch(r"0*\d{1,3}", lines[j]):
+                    qty, qbase = int(lines[j]), j
+                    break
+            if not qty:
+                continue
+            blob = " ".join(lines[qbase + 1: qbase + 4]).upper()    # DESCRIPTION (+ RATINGS)
+            pm = re.search(r"(\d)\s*-?\s*POLE", blob)
+            poles = int(pm.group(1)) if pm else None
+            if U.startswith("AC"):
+                am = re.search(r"(\d{2,3})\s*A\b", blob)
+                fused = ("FUSE" in blob and not any(n in blob for n in
+                                                    ("NON-FUSED", "NON FUSED", "NONFUSED", "NON-FUSE")))
+                if am:
+                    ac += [{"amp": int(am.group(1)), "fused": fused, "fuse_amp": None}] * qty
+            elif poles:
+                dc += [{"poles": poles}] * qty
+        return ac, dc
+
+    def _disconnects_from_schedule(self, pdf_path: str):
+        """Find the equipment/BOM schedule page (EQUIPMENT + QTY + DESCRIPTION header) and parse its
+        disconnect rows. Returns (ac_list, dc_list, page_index) — the page whose parse yields the most
+        disconnect devices; ([], [], None) if none found."""
+        doc = fitz.open(pdf_path)
+        try:
+            best = ([], [], None)
+            for i in range(doc.page_count):
+                full = doc[i].get_text() or ""
+                U = full.upper()
+                if not ("EQUIPMENT" in U and "QTY" in U and "DESCRIPTION" in U):
+                    continue
+                ac, dc = self._parse_disconnect_schedule(full)
+                if len(ac) + len(dc) > len(best[0]) + len(best[1]):
+                    best = (ac, dc, i)
+        finally:
+            doc.close()
+        return best
+
+    @staticmethod
+    def _reconcile_disconnects(vision_ac, vision_dc, sched_ac, sched_dc, sched_page):
+        """Reconcile the PV-5 one-line Vision disconnect read with the equipment-schedule read.
+        The equipment schedule, WHEN PRESENT, is AUTHORITATIVE for count + pole/rating; the one-line
+        Vision read is CORROBORATION ONLY — a mismatch is at most a NOTE, never HARD, and never
+        overrides the schedule. Schedule absent for a type -> the Vision count stands, with a NOTE that
+        it came from the one-line, not a schedule (a missing schedule is visible, not silent).
+        Returns (ac_list, dc_list, flags)."""
+        vision_ac = vision_ac or []
+        vision_dc = vision_dc or []
+        flags = []
+        if sched_ac:
+            ac = sched_ac
+            if len(sched_ac) != len(vision_ac):
+                flags.append({"level": "NOTE", "item": "ac_disconnect_count_clarified",
+                              "msg": f"AC disconnect count corrected from the PV-5 one-line Vision read "
+                                     f"({len(vision_ac)}) to {len(sched_ac)} via the equipment schedule "
+                                     f"(page {sched_page}) — schedule authoritative; one-line is "
+                                     f"corroboration only."})
+        else:
+            ac = vision_ac
+            if vision_ac:
+                flags.append({"level": "NOTE", "item": "ac_disconnect_count_from_oneline",
+                              "msg": f"No equipment schedule found; AC disconnect count "
+                                     f"({len(vision_ac)}) came from the PV-5 one-line (Vision), not a "
+                                     f"schedule — verify."})
+        if sched_dc:
+            dc = sched_dc
+            if sorted(d["poles"] for d in sched_dc) != sorted(d.get("poles") for d in vision_dc):
+                flags.append({"level": "NOTE", "item": "dc_disconnect_count_clarified",
+                              "msg": f"DC disconnects corrected from the PV-5 one-line Vision read "
+                                     f"{sorted(d.get('poles') for d in vision_dc)} to "
+                                     f"{sorted(d['poles'] for d in sched_dc)}-pole via the equipment "
+                                     f"schedule (page {sched_page}) — schedule authoritative; one-line "
+                                     f"is corroboration only."})
+        else:
+            dc = vision_dc
+            if vision_dc:
+                flags.append({"level": "NOTE", "item": "dc_disconnect_count_from_oneline",
+                              "msg": f"No equipment schedule found; DC disconnect count "
+                                     f"({len(vision_dc)}) came from the PV-5 one-line (Vision), not a "
+                                     f"schedule — verify."})
+        return ac, dc, flags
+
+    @staticmethod
     def _extract_harness_code(text: str) -> Optional[str]:
         """Find the Tesla expansion harness length code in free text. Matches '1875157-05-X',
         '1875157 05', etc. (optional spaces/hyphens, case-insensitive). Returns '05'|'20'|'40' or None."""
@@ -1189,6 +1290,23 @@ class PlansetExtractor:
                     "level": "NOTE", "item": "csr_text_vs_vision",
                     "msg": f"CSR: text-layer {tl_csr} vs Vision {vis_csr}; delivered the text-layer "
                            f"read (the gateway enclosure rating is not a breaker token)."})
+
+        # --- Step 2.6: Disconnect count + pole/rating. The equipment schedule (EQUIPMENT|QTY|
+        # DESCRIPTION, e.g. PV-5.1) states the true count deterministically and is AUTHORITATIVE WHEN
+        # PRESENT; the PV-5 one-line Vision read over-counts symbols (Ritchason: 4 AC / 3 four-pole DC,
+        # missing both 2-pole) and is CORROBORATION ONLY (NOTE on mismatch, never HARD, never
+        # overrides). The schedule is not on every planset -> absent: the Vision count stands with a
+        # NOTE that it came from the one-line (missing schedule is visible, never a hard dependency). ---
+        vis_ac = electrical_data.get("ac_disconnects") or []
+        vis_dc = electrical_data.get("dc_disconnects") or []
+        electrical_data["ac_disconnects_vision"] = vis_ac
+        electrical_data["dc_disconnects_vision"] = vis_dc
+        sched_ac, sched_dc, sched_pg = self._disconnects_from_schedule(pdf_path)
+        ac_final, dc_final, disc_flags = self._reconcile_disconnects(
+            vis_ac, vis_dc, sched_ac, sched_dc, sched_pg)
+        electrical_data["ac_disconnects"] = ac_final
+        electrical_data["dc_disconnects"] = dc_final
+        extraction_flags.extend(disc_flags)
 
         # --- Step 3: Extract roof plan (PV-3) — same HARD-fail policy ---
         pv3_page = self._find_page_by_label(pdf_path, "PV-3")
