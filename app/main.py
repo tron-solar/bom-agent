@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import logging
 import os
+import platform
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -117,4 +118,5 @@ def healthz():
         "claude_model": os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6 (default)"),
         "create_bom_task_key": CONFIG.create_bom_task_key,
         "file_storage_dir": CONFIG.file_storage_dir,
+        "python_version": platform.python_version(),
     }
