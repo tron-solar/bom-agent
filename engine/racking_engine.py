@@ -308,20 +308,23 @@ def k2_ground_mount(bom_table, has_enphase_micros, module_count):
           "diag_brace"              -> row 89
           "pipe_coupling_3"         -> row 84 SPECIAL (see rule 4)
 
-    FOUR STRUCTURAL RULES (user, Munoz):
+    STANDING RULE: GM rows 73-89 are a STRICT VERBATIM TABLE READ of the PV-3.1 "Table 1 Bill of
+    materials" quantities — every row's qty is the table value, nothing is computed.
+
       1. NEVER include HEYClip SunRunner Cable Clip SS (4000382) on a GM BOM — dropped entirely.
       2. ONLY include CR Micro inverter & OPT 13mm Hex (4000629-H, row 81) when the project
          specifies ENPHASE micro-inverters. Tesla-MCI ground mounts -> excluded.
       3. NEVER include K2 Cross Cap (4000312) on a GM BOM — dropped entirely.
-      4. Pipe Coupling 3" (Third Party) -> ALWAYS create a new SKU in ROW 84: B84 = C84 =
-         the exact verbiage "Pipe Coupling 3\" (Third Party)", qty pulled from the plans.
+      4. Pipe Coupling 3" (Third Party) -> new SKU in ROW 84: B84 = C84 = the exact verbiage
+         "Pipe Coupling 3\" (Third Party)", qty from the table.
+      5. End cap (4001221, row 78) and wire clip (4000069, row 83) are TABLE-READ verbatim, exactly
+         like every other 73-89 row. (Previously end_cap = rail_qty*2 and wire_clip = module_count*2;
+         both computed rules removed — they produced wrong numbers, e.g. end cap 156 vs the table's 52.)
+      6. The "Pipe - Length 10 ft (Third Party)" line IS the 120" Rear N/S Pipe 3" (row 87). Map
+         "ew_pipe"/"pipe_10ft" -> row 87 (NOT row 88). qty from the table.
 
-    THREE MORE COMPUTED/MAPPING RULES (user):
-      5. END CAP (4001221, row 78) = total RAIL qty * 2 (rows 73 + 74 summed), ALWAYS — computed,
-         NOT read from the table (overrides any table value).
-      6. WIRE CLIP (4000069, row 83) = module_count * 2, ALWAYS — computed, NOT from the table.
-      7. The "Pipe - Length 10 ft (Third Party)" line IS the 120" Rear N/S Pipe 3" (row 87).
-         Map "ew_pipe"/"pipe_10ft" -> row 87 (NOT row 88). qty from plans.
+    module_count is retained in the signature for caller compatibility but is no longer used (wire
+    clip is table-read now, not module_count*2).
 
     Returns (rows, cell_overrides, flags):
       rows: {solar_row: qty}; cell_overrides: {row: (B_text, C_text)} for the row-84 SKU creation.
@@ -332,31 +335,27 @@ def k2_ground_mount(bom_table, has_enphase_micros, module_count):
         "4001196": 75, "splice": 75,
         "4000198": 76, "top_cap": 76,
         "4000175": 77, "pipe_bracket": 77,
-        # 4001221 end cap (78) is COMPUTED (rule 5), not table-read
-        "4000145": 80, "combo_clamp": 80,
+        "4001221": 78, "end_cap": 78,           # rule 5: TABLE-READ verbatim (was computed rails*2)
+        "4000145": 80, "combo_clamp": 80,       # cross-clamp set: mid + end already SUMMED upstream
         "4000006-H": 82, "ground_lug": 82,
-        # 4000069 wire clip (83) is COMPUTED (rule 6)
+        "4000069": 83, "wire_clip": 83,         # rule 5: TABLE-READ verbatim (was computed modules*2)
         "ground_screw": 85,
         "ns_pipe_front_60": 86,
-        # rule 7: the third-party 10ft pipe is the 120" Rear N/S Pipe -> row 87
+        # rule 6: the third-party 10ft pipe is the 120" Rear N/S Pipe -> row 87
         "ns_pipe_rear_120": 87, "ew_pipe": 87, "pipe_10ft": 87,
         "diag_brace": 89,
     }
-    # Rules 1 & 3: NEVER on a GM BOM. Also drop any table end-cap/wire-clip — they are computed (5,6).
+    # Rules 1 & 3: NEVER on a GM BOM.
     _NEVER = {"4000382", "heyclip", "sunrunner", "4000312", "cross_cap", "k2_cross_cap"}
-    _COMPUTED_SKIP = {"4001221", "end_cap", "4000069", "wire_clip", "wireclip"}
 
     rows: dict[int, int] = {}
     overrides: dict[int, tuple] = {}
     flags: list = []
-    rail_qty = 0
 
     for key, qty in bom_table.items():
         k = str(key).lower()
         if k in _NEVER:
             continue  # rules 1 & 3
-        if k in _COMPUTED_SKIP:
-            continue  # rules 5 & 6 compute these; ignore any table value
         # rule 2: micro-inverter lug only with Enphase
         if key in ("4000629-H", "4000629") or "micro inverter" in k or "mlpe" in k:
             if has_enphase_micros:
@@ -368,20 +367,13 @@ def k2_ground_mount(bom_table, has_enphase_micros, module_count):
             rows[84] = qty
             overrides[84] = (verbiage, verbiage)
             continue
-        # normal mapped lines
+        # every other line: VERBATIM table qty -> its row
         if key in _MAP:
             r = _MAP[key]
             rows[r] = rows.get(r, 0) + qty
-            if r in (73, 74):
-                rail_qty += qty
         else:
             flags.append({"level": "WARN", "item": "gm_line_unmapped",
                           "detail": f"K2 GM BOM line {key!r} (qty {qty}) has no template row"})
-
-    # rule 5: end cap (78) = rail qty * 2, ALWAYS
-    rows[78] = rail_qty * 2
-    # rule 6: wire clip (83) = module_count * 2, ALWAYS
-    rows[83] = module_count * 2
 
     return rows, overrides, flags
 

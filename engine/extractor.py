@@ -805,38 +805,56 @@ class PlansetExtractor:
                 out["modules"] = qty
         return out, triples
 
-    @staticmethod
-    def _normalize_gm_key(part_number, description):
-        """Map a K2 ground-mount BOM row to a key k2_ground_mount() recognizes — by DESCRIPTION first
-        (robust to OCR'd / variant part numbers), part number as backup. Returns None if unrecognized
-        (caller flags it; never guessed)."""
+    # exact K2 GM part number -> normalized key. AUTHORITATIVE: each row maps by ITS OWN part number,
+    # so a description substring can't cross-route a row (the end cap "EndCap, Black, CR80" contains
+    # "CR80" and was being mistaken for the CR80 rail, summing 26+52 -> 78 on the rail row).
+    _GM_PART_KEY = {
+        "4001370": "rail_216", "4000708": "rail_172",
+        "4001196": "splice", "4000198": "top_cap",
+        "4000175": "pipe_bracket", "4000075": "pipe_bracket",
+        "4001221": "end_cap", "4000069": "wire_clip",
+        "4000145": "combo_clamp", "4000135": "combo_clamp", "4000035": "combo_clamp",
+        "4000006-H": "ground_lug",
+        "4000382": "4000382",            # HEYClip -> excluded downstream
+        "4000312": "k2_cross_cap", "4000372": "k2_cross_cap",   # Cross Cap -> excluded downstream
+        "4000629-H": "4000629-H", "4000629": "4000629-H",       # micro lug (Enphase only)
+    }
+
+    @classmethod
+    def _normalize_gm_key(cls, part_number, description):
+        """Map a K2 ground-mount BOM row to a key k2_ground_mount() recognizes. PART NUMBER is
+        authoritative (each part maps to ITS OWN row); DESCRIPTION is only a fallback for rows whose
+        part-number cell is blank/unreadable. Returns None if unrecognized (caller flags it)."""
         U = (description or "").upper()
         P = (part_number or "").upper().strip()
-        if "CROSSRAIL 80" in U or "CROSSRAIL80" in U or "CR80" in U or P in ("4001370", "4000708"):
-            if "172" in U or P == "4000708":
-                return "rail_172"
-            return "rail_216"            # 216" default (incl. P==4001370)
-        if "HEYCLIP" in U or "SUNRUNNER" in U or P == "4000382":
-            return "4000382"             # rule 1: NEVER on a GM BOM
-        if "CROSS CAP" in U or P == "4000372":
-            return "k2_cross_cap"        # rule 3: NEVER on a GM BOM
-        if "MICRO" in U or "MLPE" in U or P in ("4000629-H", "4000629"):
-            return "4000629-H"           # rule 2: only with Enphase
-        if "END CAP" in U or P == "4001221":
-            return "end_cap"             # rule 5: COMPUTED, table value ignored
-        if "WIRE" in U or ("CLIP" in U and "CROSS" not in U) or P == "4000069":
-            return "wire_clip"           # rule 6: COMPUTED, table value ignored
+        if P in cls._GM_PART_KEY:
+            return cls._GM_PART_KEY[P]
+        # description fallback (blank/variant part number). Order specific labels before the broad
+        # rail check; the rail is keyed on "CROSSRAIL" (NOT bare "CR80", which also appears in the
+        # end-cap description).
+        if "HEYCLIP" in U or "SUNRUNNER" in U:
+            return "4000382"
+        if "CROSS CAP" in U:
+            return "k2_cross_cap"
+        if "MICRO" in U or "MLPE" in U:
+            return "4000629-H"
+        if "END CAP" in U or "ENDCAP" in U:
+            return "end_cap"
+        if "WIRE" in U or ("CLIP" in U and "CROSS" not in U):
+            return "wire_clip"
         if "PIPE COUPLING" in U:
-            return "pipe_coupling_3"     # rule 4: new SKU row 84
-        if "SPLICE" in U or "CONNECTOR" in U or P == "4001196":
+            return "pipe_coupling_3"
+        if "SPLICE" in U or "CONNECTOR" in U:
             return "splice"
-        if "TOP CAP" in U or P == "4000198":
+        if "TOP CAP" in U:
             return "top_cap"
-        if "BRACKET" in U or P in ("4000175", "4000075"):
+        if "BRACKET" in U:
             return "pipe_bracket"
-        if "CROSS CLAMP" in U or "MID CLAMP" in U or "END CLAMP" in U or "COMBO" in U or P in ("4000145", "4000035"):
+        if "CROSS CLAMP" in U or "MID CLAMP" in U or "END CLAMP" in U or "COMBO" in U:
             return "combo_clamp"
-        if "GROUND LUG" in U or P == "4000006-H":
+        if "CROSSRAIL" in U:
+            return "rail_172" if "172" in U else "rail_216"
+        if "GROUND LUG" in U:
             return "ground_lug"
         if "LENGTH 10" in U or "10 FT" in U or "10FT" in U:
             return "pipe_10ft"
