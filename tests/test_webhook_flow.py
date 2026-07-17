@@ -13,6 +13,7 @@ import os
 os.environ.setdefault("FILE_STORAGE_DIR", "/tmp/bom_test_files")
 os.environ.setdefault("PUBLIC_BASE_URL", "http://localhost:8000")
 os.environ.setdefault("COPERNIQ_WEBHOOK_SECRET", "")  # dev: skip sig unless a test sets it
+os.environ.setdefault("WORK_ORDER_WEBHOOK_TOKEN", "test-wo-token")  # path-secret for the WO endpoint
 
 import importlib
 import openpyxl
@@ -130,6 +131,79 @@ def test_draft_mode_false_drops_prefix(monkeypatch):
     assert "BOM Joseph Woroszylo (pending review).xlsx" in names
     assert "Confidence Report (BOM Joseph Woroszylo).docx" in names
     assert not any(n.startswith("DRAFT") for n in names)
+
+
+_WO_TOKEN = "test-wo-token"
+
+
+def _wire_wo(monkeypatch):
+    """_wire + guarantee main.CONFIG carries the WO path token (import order can build CONFIG before
+    this module's env setdefault runs). Config is frozen -> swap the object."""
+    import dataclasses
+    fake = _wire(monkeypatch)
+    monkeypatch.setattr(main, "CONFIG",
+                        dataclasses.replace(main.CONFIG, work_order_webhook_token=_WO_TOKEN))
+    return fake
+
+
+def _wo_payload(title, record_id, rtype="PROJECT"):
+    return {"workOrder": {"id": 5001, "title": title, "recordId": record_id, "status": "OPEN"},
+            "record": {"id": record_id, "title": "Joseph Woroszylo", "type": rtype},
+            "event": {"workOrderId": 5001, "recordId": record_id, "triggerKey": "TASK_CREATED",
+                      "triggerName": "Work Order created"}}
+
+
+def test_work_order_webhook_fires_on_bom_title(monkeypatch):
+    fake = _wire_wo(monkeypatch)
+    c = TestClient(main.app)
+    r = c.post(f"/webhooks/coperniq/work-order/{_WO_TOKEN}", json=_wo_payload("Create BOM", 611000))
+    assert r.status_code == 202 and r.json()["project_id"] == "611000"
+    assert fake.files and any(n.startswith("DRAFT — BOM Joseph Woroszylo") for n in
+                              (f["name"] for f in fake.files))               # pipeline fired for 611000
+
+
+def test_work_order_webhook_title_case_insensitive(monkeypatch):
+    fake = _wire_wo(monkeypatch)
+    c = TestClient(main.app)
+    r = c.post(f"/webhooks/coperniq/work-order/{_WO_TOKEN}", json=_wo_payload("  create bom ", 611001))
+    assert r.status_code == 202 and fake.files                              # trimmed + case-insensitive
+
+
+def test_work_order_webhook_ignores_other_title(monkeypatch):
+    fake = _wire_wo(monkeypatch)
+    c = TestClient(main.app)
+    r = c.post(f"/webhooks/coperniq/work-order/{_WO_TOKEN}", json=_wo_payload("Site Survey", 611002))
+    assert r.status_code == 200 and r.json()["status"] == "ignored"
+    assert "work_order_title=Site Survey" in r.json()["reason"]
+    assert fake.files == []                                                 # did NOT fire
+
+
+def test_work_order_webhook_ignores_non_project(monkeypatch):
+    fake = _wire_wo(monkeypatch)
+    c = TestClient(main.app)
+    r = c.post(f"/webhooks/coperniq/work-order/{_WO_TOKEN}",
+               json=_wo_payload("Create BOM", 611003, rtype="REQUEST"))
+    assert r.status_code == 200 and r.json()["status"] == "ignored"
+    assert fake.files == []
+
+
+def test_work_order_webhook_bad_token(monkeypatch):
+    _wire_wo(monkeypatch)
+    c = TestClient(main.app)
+    assert c.post("/webhooks/coperniq/work-order/wrong", json=_wo_payload("Create BOM", 611004)
+                  ).status_code == 401
+    assert c.post("/webhooks/coperniq/work-order/", json=_wo_payload("Create BOM", 611004)
+                  ).status_code in (401, 404)                               # empty token: not a valid path
+
+
+def test_work_order_webhook_duplicate_delivery_idempotent(monkeypatch):
+    fake = _wire_wo(monkeypatch)
+    c = TestClient(main.app)
+    p = _wo_payload("Create BOM", 611005)
+    c.post(f"/webhooks/coperniq/work-order/{_WO_TOKEN}", json=p)            # 1st: fires -> 2 files
+    c.post(f"/webhooks/coperniq/work-order/{_WO_TOKEN}", json=p)            # 2nd: idempotency-skipped
+    assert pipeline.already_processed("611005", "create_bom")
+    assert len(fake.files) == 2                                            # no double-post
 
 
 def test_served_file_roundtrip(monkeypatch):

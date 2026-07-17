@@ -20,6 +20,8 @@ class Config:
     file_storage_dir: str
     file_url_ttl_hours: int
     create_bom_task_key: str
+    work_order_webhook_token: str
+    work_order_bom_title: str
     draft_mode: bool
     libreoffice_bin: str
 
@@ -35,6 +37,11 @@ class Config:
             file_storage_dir=os.environ.get("FILE_STORAGE_DIR", "/data/bom-files"),
             file_url_ttl_hours=int(os.environ.get("FILE_URL_TTL_HOURS", "168")),
             create_bom_task_key=os.environ.get("CREATE_BOM_TASK_KEY", "create_bom"),
+            # Coperniq's "Work Order created" automation posts an UNSIGNED webhook, so that endpoint
+            # authenticates on a URL-path shared secret instead of HMAC. work_order_bom_title is the
+            # work-order title that triggers a BOM run (matched case-insensitively, trimmed).
+            work_order_webhook_token=os.environ.get("WORK_ORDER_WEBHOOK_TOKEN", ""),
+            work_order_bom_title=os.environ.get("WORK_ORDER_BOM_TITLE", "Create BOM"),
             # draft_mode True -> attached file display names keep the "DRAFT — " prefix. Flip to False
             # at go-live (DRAFT_MODE=0) to drop the prefix. Controls ONLY the prefix (Fixes 4-6).
             draft_mode=_bool(os.environ.get("DRAFT_MODE"), True),

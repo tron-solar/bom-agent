@@ -83,6 +83,48 @@ async def create_bom_webhook(
                         status_code=202)
 
 
+@app.post("/webhooks/coperniq/work-order/{token}")
+async def work_order_webhook(token: str, request: Request, background: BackgroundTasks):
+    """Coperniq's 'Work Order created' automation fires this. It sends an UNSIGNED POST (no signature
+    header), so this path authenticates on a URL-path shared secret ({token} == WORK_ORDER_WEBHOOK_
+    TOKEN) instead of HMAC. It reuses the SAME pipeline + idempotency as the manual create-bom
+    endpoint. Payload: {workOrder:{title, recordId, ...}, record:{id, type, ...}, event:{recordId}}."""
+    expected = CONFIG.work_order_webhook_token
+    if not expected or token != expected:
+        raise HTTPException(status_code=401, detail="bad token")
+
+    try:
+        payload = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"bad payload: {e}")
+
+    wo = payload.get("workOrder") or {}
+    rec = payload.get("record") or {}
+    ev = payload.get("event") or {}
+
+    # ignore non-project records
+    rtype = str(rec.get("type") or "").strip().upper()
+    if rtype and rtype != "PROJECT":
+        return JSONResponse({"status": "ignored", "reason": f"record_type={rec.get('type')}"},
+                            status_code=200)
+
+    # fire only for the BOM work-order title (case-insensitive, trimmed)
+    title = str(wo.get("title") or "").strip()
+    if title.lower() != (CONFIG.work_order_bom_title or "Create BOM").strip().lower():
+        return JSONResponse({"status": "ignored", "reason": f"work_order_title={wo.get('title')}"},
+                            status_code=200)
+
+    project_id = wo.get("recordId") or rec.get("id") or ev.get("recordId")
+    if not project_id:
+        raise HTTPException(status_code=400, detail="no project_id in work-order webhook")
+
+    # SAME pipeline + task_key + idempotency marker as the manual endpoint (duplicate deliveries skip).
+    task_key = CONFIG.create_bom_task_key
+    background.add_task(_run, str(project_id), task_key)
+    return JSONResponse({"status": "accepted", "project_id": str(project_id), "task_key": task_key},
+                        status_code=202)
+
+
 def _run(project_id: str, task_key: str):
     try:
         result = pipeline.process(project_id, task_key)
