@@ -37,6 +37,9 @@ GUIDE: dict[str, tuple[str, str]] = {
     "buskit_text_vs_vision": (
         "Electrical BOM",
         "Confirm all necessary breakers are added."),
+    "csr_text_vs_vision": (
+        "Electrical BOM",
+        "Confirm the CSR/main breaker(s) are added with the correct rating and poles."),
     "harness_pn_source": (
         "Solar BOM — expansion harness row (63/64/65)",
         "Confirm the expansion harness P/N matches the planset."),
