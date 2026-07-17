@@ -109,7 +109,7 @@ def healthz():
     pub = CONFIG.public_base_url
     return {
         "ok": True,
-        "shadow_mode": CONFIG.shadow_mode,
+        "draft_mode": CONFIG.draft_mode,
         "public_base_url": pub,
         "public_base_url_has_https": pub.startswith("https://"),  # MUST be True for working file links
         "has_anthropic_key": bool(CONFIG.anthropic_api_key),

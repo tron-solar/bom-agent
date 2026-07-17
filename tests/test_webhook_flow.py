@@ -109,6 +109,29 @@ def test_full_flow_attaches_and_notifies(monkeypatch):
     assert "HARD FLAGS PRESENT" in fake.comments[0]
 
 
+def test_draft_mode_true_carries_prefix(monkeypatch):
+    # default draft_mode True -> both display names carry "DRAFT — "
+    fake = _wire(monkeypatch)
+    c = TestClient(main.app)
+    c.post("/webhooks/coperniq/create-bom", json={"project_id": 700111, "task_key": "create_bom"})
+    names = [f["name"] for f in fake.files]
+    assert "DRAFT — BOM Joseph Woroszylo (pending review).xlsx" in names
+    assert "DRAFT — Confidence Report (BOM Joseph Woroszylo).docx" in names
+
+
+def test_draft_mode_false_drops_prefix(monkeypatch):
+    # go-live: DRAFT_MODE off -> draft_mode False -> NO "DRAFT — " prefix on either file
+    import dataclasses
+    fake = _wire(monkeypatch)
+    monkeypatch.setattr(pipeline, "CONFIG", dataclasses.replace(pipeline.CONFIG, draft_mode=False))
+    c = TestClient(main.app)
+    c.post("/webhooks/coperniq/create-bom", json={"project_id": 700222, "task_key": "create_bom"})
+    names = [f["name"] for f in fake.files]
+    assert "BOM Joseph Woroszylo (pending review).xlsx" in names
+    assert "Confidence Report (BOM Joseph Woroszylo).docx" in names
+    assert not any(n.startswith("DRAFT") for n in names)
+
+
 def test_served_file_roundtrip(monkeypatch):
     fake = _wire(monkeypatch)
     c = TestClient(main.app)
