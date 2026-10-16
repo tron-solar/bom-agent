@@ -1321,13 +1321,36 @@ class PlansetExtractor:
         # missing both 2-pole) and is CORROBORATION ONLY (NOTE on mismatch, never HARD, never
         # overrides). The schedule is not on every planset -> absent: the Vision count stands with a
         # NOTE that it came from the one-line (missing schedule is visible, never a hard dependency). ---
+        # TEXT-ONLY RULE (user, 2026-10-16 error sweep — Pons/Capron/Ponce/Taylor/Wyer/Leiner/Wood/...):
+        # AC and DC disconnects come ONLY from planset TEXT: (1) the BOM/equipment table, else (2) a
+        # rated one-line text call-out. No text call-out -> no disconnect. The Vision symbol read is
+        # kept for the confidence report only and NEVER adds/changes a disconnect.
+        from engine import text_tables as _tt
         vis_ac = electrical_data.get("ac_disconnects") or []
         vis_dc = electrical_data.get("dc_disconnects") or []
         electrical_data["ac_disconnects_vision"] = vis_ac
         electrical_data["dc_disconnects_vision"] = vis_dc
-        sched_ac, sched_dc, sched_pg = self._disconnects_from_schedule(pdf_path)
-        ac_final, dc_final, disc_flags = self._reconcile_disconnects(
-            vis_ac, vis_dc, sched_ac, sched_dc, sched_pg)
+        eq_rows, eq_pg = _tt.equipment_rows(pdf_path)
+        electrical_data["equipment_rows"] = eq_rows
+        tab_ac, tab_dc = _tt.disconnects_from_rows(eq_rows)
+        co_ac, co_dc = _tt.disconnects_from_callouts(self._page_text(pdf_path, pv5_page))
+        ac_final = tab_ac or co_ac
+        dc_final = tab_dc or co_dc
+        # a fused table row without a fuse size: take the fuse size from a matching one-line call-out
+        for d in ac_final:
+            if d.get("fused") and not d.get("fuse_amp"):
+                m = next((c for c in co_ac if c.get("fused") and c.get("amp") == d["amp"]
+                          and c.get("fuse_amp")), None)
+                if m:
+                    d["fuse_amp"] = m["fuse_amp"]
+        disc_flags = []
+        for kind, fin, vis, src in (("ac", ac_final, vis_ac, "table" if tab_ac else "callout"),
+                                    ("dc", dc_final, vis_dc, "table" if tab_dc else "callout")):
+            if len(fin) != len(vis):
+                disc_flags.append({
+                    "level": "NOTE", "item": f"{kind}_disconnect_text_vs_vision",
+                    "msg": f"{kind.upper()} disconnects delivered from planset TEXT ({src}): {len(fin)}; "
+                           f"one-line symbol read saw {len(vis)} (not used — text only)."})
         electrical_data["ac_disconnects"] = ac_final
         electrical_data["dc_disconnects"] = dc_final
         extraction_flags.extend(disc_flags)
@@ -1432,6 +1455,22 @@ class PlansetExtractor:
         # --- Step 4: Resolve expansion mount kit (plans -> master note -> default wall) ---
         plan_mount = (string_data.get("plan_mount") or array_data.get("plan_mount")
                       or electrical_data.get("expansion_mount"))   # PV-5 Vision mount keyword
+        # TEXT GATE (user, Lass #877080 / Fickas #857566): the plan only "says stack/wall" if the
+        # planset TEXT says so (stack kit P/N 1978070 / 'STACK' ; wall kit 1978069 / 'WALL MOUNT').
+        # A Vision-only mount keyword is dropped -> master note -> default WALL.
+        if plan_mount:
+            try:
+                _d = fitz.open(pdf_path)
+                _all = " ".join((pg.get_text() or "") for pg in _d).upper()
+                _d.close()
+            except Exception:  # noqa: BLE001
+                _all = ""
+            _pm = str(plan_mount).lower()
+            if "stack" in _pm and not ("1978070" in _all.replace(" ", "") or "STACK" in _all):
+                plan_mount = None
+            elif "wall" in _pm and not ("1978069" in _all.replace(" ", "") or "WALL MOUNT" in _all
+                                        or "WALL-MOUNT" in _all):
+                plan_mount = None
         master_notes = None
         if coperniq_project is not None or master_note_form is not None:
             try:
@@ -1447,6 +1486,12 @@ class PlansetExtractor:
             mount_kit = "wall"
         # The RESOLVED mount (stack/wall) drives the orchestrator's tesla_expansion mount-kit row.
         electrical_data["expansion_mount"] = mount_kit
+        if isinstance(master_notes, dict):
+            electrical_data["master_note_text"] = " ".join(
+                str(master_notes.get(k, "") or "") for k in
+                ("design_notes", "additional_notes", "installation_notes", "field_installation_notes"))
+        elif master_notes:
+            electrical_data["master_note_text"] = str(master_notes)
         if master_note_form is None and not plan_mount:
             warnings.append("expansion mount: no plan keyword and no Master Note form supplied; "
                             "defaulted to wall — fetch get_form(Master Note) and pass master_note_form")
@@ -1612,6 +1657,11 @@ class PlansetExtractor:
                       "source": src}
             if planes is None:
                 jboxes["unresolved"] = src
+            # Per-plane ROOF TYPE (one ROOF DESCRIPTION table per structure; user, Wyer #915365 /
+            # Head #976824): lets the J-box block pick JB-1.2 vs JB-3 PER PLANE instead of per project.
+            if mount_type != "ground":
+                from engine import text_tables as _tt
+                jboxes["planes_by_type"] = _tt.roof_planes_by_type(pdf_path, pv3_page)
         except Exception as e:  # noqa: BLE001 — never fail the whole run on the J-box read
             jboxes = {"planes": None, "modules_per_plane": [],
                       "module_total": int(cover_data.get("module_quantity") or 0),

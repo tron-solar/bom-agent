@@ -584,6 +584,54 @@ def main_service_panel(new_msp_drawn, msp_pn=None):
 # (never a HARD hold, never an override). This is the inverse of the mount-resolution precedence:
 # mount is not drawn as a discrete value on most plans, so the note legitimately fills it; but any
 # value the plan DOES state (harness P/N, breakers, meter SKU, module/battery counts) wins.
+_MSP_LINE = re.compile(r"\b(MSP|MAIN SERVICE PANEL|MAIN PANEL|LOAD CENTER|LOADCENTER|MAIN BREAKER PANEL)\b")
+_MODEL = re.compile(r"\b([A-Z]{2,5}\d{2,}[A-Z0-9]*(?:-[A-Z0-9]+)*)\b")
+
+
+def msp_pn_from_text(text):
+    """NEW MSP model number from Master Note / planset text (user, Douglas #967510 / Hundley #878377 /
+    Wade #955324 / C. Murphy #894545). Returns (pn, line) or (None, None).
+      - a known MSP SKU (rows 74-78) anywhere in the text wins;
+      - else a model-number token on a line that names the MSP AND says it is NEW / an UPGRADE /
+        REPLACE / INSTALL; lines saying it 'can remain' never count."""
+    if not text:
+        return None, None
+    T = str(text).upper()
+    for sku in _MSP_SKU_ROW:
+        if sku in T.replace(" ", ""):
+            return sku, sku
+    for raw in T.splitlines():
+        L = " ".join(raw.split())
+        if not _MSP_LINE.search(L):
+            continue
+        if "REMAIN" in L or ("EXISTING" in L and not any(w in L for w in ("UPGRADE", "REPLACE"))):
+            continue
+        if not any(w in L for w in ("NEW", "UPGRADE", "REPLACE", "INSTALL", "(N)")):
+            continue
+        for m in _MODEL.finditer(L):
+            tok = m.group(1)
+            if tok.startswith(("AWG", "THHN", "REV")):
+                continue
+            return tok, L
+    return None, None
+
+
+def main_service_panel_resolved(plan_new, plan_pn, note_text, plan_text=""):
+    """MSP precedence (user, 2026-10-16): if EITHER the Master Note or the plans call out a new MSP, it
+    goes on the BOM; if both give a SKU and they DIFFER, the MASTER NOTE wins (NOTE flag)."""
+    note_pn, _ = msp_pn_from_text(note_text)
+    text_pn, _ = msp_pn_from_text(plan_text)
+    plan_pn = plan_pn or text_pn
+    flags = []
+    if note_pn and plan_pn and note_pn.replace("-", "") != str(plan_pn).upper().replace("-", ""):
+        flags.append({"level": "NOTE", "item": "msp_note_vs_plan",
+                      "detail": f"MSP SKU: Master Note {note_pn!r} vs plan {plan_pn!r} — Master Note wins."})
+    pn = note_pn or plan_pn
+    new = bool(note_pn) or bool(plan_new) or bool(text_pn)
+    rows, f2, so = main_service_panel(new, pn)
+    return rows, flags + f2, so
+
+
 def plan_vs_note(item, plan_value, note_value):
     """Deliver plan_value; if note_value is present and differs, return a NOTE flag. Returns
     (delivered_value, flag_or_None). note_value None/empty -> no check (note silent on this item)."""

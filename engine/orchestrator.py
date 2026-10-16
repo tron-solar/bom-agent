@@ -18,6 +18,7 @@ equipment SKU + new-vs-existing) is FLAGGED for human review — never guessed. 
 is confidently computable (module line, battery/RSD, header) plus the flags; a human completes the rest.
 """
 from __future__ import annotations
+import math
 import asyncio
 import os
 import shutil
@@ -194,9 +195,26 @@ def _build_blocks(planset, project: dict):
     # Mount was already resolved in the extractor (plan -> Master Note -> default wall).
     exp_count = elec.get("expansion_count")
     if exp_count and int(exp_count) > 0:
-        _run_block("tesla_expansion", flags, elec_rows,
-                   lambda: ee.tesla_expansion(int(exp_count), harness_pn=elec.get("harness_pn"),
-                                              mount=elec.get("expansion_mount")))
+        def _exp():
+            n = int(exp_count)
+            r, f = ee.tesla_expansion(n, harness_pn=elec.get("harness_pn"),
+                                      mount=elec.get("expansion_mount"))
+            # PER-UNIT split from the Master Note (user, Murphy #852366: 1 stack/-05 + 1 wall/-20)
+            alloc = ee.expansion_allocation_from_note(elec.get("master_note_text") or "", n)
+            if "mount" in alloc and len(alloc["mount"]) > 1:
+                for k in (61, 62):
+                    r.pop(k, None)
+                r.update(alloc["mount"])
+            if "harness" in alloc and (len(alloc["harness"]) > 1 or not elec.get("harness_pn")):
+                for k in (63, 64, 65):
+                    r.pop(k, None)
+                r.update(alloc["harness"])
+                f = [x for x in f if x.get("item") not in ("expansion_harness_pn_missing",
+                                                           "expansion_harness_pn_unrecognized")]
+                f.append({"level": "NOTE", "item": "expansion_harness_split",
+                          "detail": f"Harness per unit from Master Note: {alloc['harness']}."})
+            return r, f
+        _run_block("tesla_expansion", flags, elec_rows, _exp)
     elif (pw3_skus or battery_count) and exp_count is None:
         # Battery system, but the expansion count couldn't be read (not an explicit 0). Don't silently
         # omit the expansion block — flag for review.
@@ -210,7 +228,9 @@ def _build_blocks(planset, project: dict):
                lambda: ee.meter_socket(bool(elec.get("new_meter_drawn")), elec.get("meter_pn")), elec_special)
     # MSP line + special-order P/N (rows 73-79): NEW MSP only; unmapped -> row 79 stamped.
     _run_block("main_service_panel", flags, elec_rows,
-               lambda: ee.main_service_panel(bool(elec.get("new_msp_drawn")), elec.get("msp_pn")), elec_special)
+               lambda: ee.main_service_panel_resolved(bool(elec.get("new_msp_drawn")), elec.get("msp_pn"),
+                                                      elec.get("master_note_text") or "",
+                                                      elec.get("one_line_text") or ""), elec_special)
 
     # --- Completeness gates: a PV-5 read that came back but is missing CORE items is an extraction
     #     miss, not a clean BOM. These encode physical install invariants so an implausibly-empty
@@ -404,20 +424,37 @@ def _racking_block(planset):
     #   S5_SOLARFOOT     -> row 38 + row 39 L-foot (1/attach; PV-14: L-foot NOT included), no screws
     # (user, Wilson #877515 / Murphy #852366 / Franklin #852401 / Pons #853892 / Howell #857902:
     #  S-5! was previously HARD-flagged 'not auto-routed', leaving the whole roof block empty.)
+    # MIXED ROOF TYPES (user, Head #976824 / Wyer #915365): the BOM table lists ONE attachment line
+    # PER TYPE (e.g. 32 K2 Multimount deck-mounted + 112 S-5! ProteaBracket). Route every type's qty.
+    from . import text_tables as _tt
+    _eq_rows = ((getattr(planset, "electrical", None) or {}).get("equipment_rows")) or []
+    by_type = {k: v for k, v in _tt.attachments_from_rows(_eq_rows).items() if k != "UNKNOWN"}
+    if by_type and at not in ("K2_GROUND",) and system != "ground":
+        at = at if at in by_type else next(iter(by_type))
     if at in ("K2_SHINGLE", "S5_PROTEABRACKET", "S5_SOLARFOOT"):
         roof = rk.get("roof") or {}
         att, rails, splice = roof.get("attachments"), roof.get("rails"), roof.get("splice")
         mid, ends = roof.get("mid_clamps"), roof.get("end_clamps")
-        if att is not None:
-            if at == "K2_SHINGLE":
-                rows[33] = att                               # K2 Multimount shingle attachment
-                rows[46] = att                               # K2 rail clamp = attachment qty (truth)
-                rows[35] = re_eng.f_deck_screw(att)          # deck screw = 4*attach (default; lag row 34 alt)
-            elif at == "S5_PROTEABRACKET":
-                rows[37] = att                               # ProteaBracket (L-foot included)
-            else:                                            # S5_SOLARFOOT
-                rows[38] = att                               # SolarFoot
-                rows[39] = att                               # separate L-foot, 1 per SolarFoot
+        alloc = dict(by_type) if by_type else ({at: att} if att is not None else {})
+        k2 = alloc.get("K2_SHINGLE")
+        if k2:
+            rows[33] = k2                                    # K2 Multimount shingle attachment
+            rows[46] = k2                                    # K2 rail clamp = K2 attachment qty (truth)
+            mnt = _tt.k2_attach_mounting(_eq_rows)
+            if mnt["rafter"] and mnt["rafter"] + mnt["deck"] == k2:
+                rows.update(re_eng.f_k2_shingle_screws(k2, mnt["deck"], mnt["rafter"]))
+            else:
+                rows[35] = re_eng.f_deck_screw(k2)           # deck screw = 4*attach (default)
+        if alloc.get("S5_PROTEABRACKET"):
+            rows[37] = alloc["S5_PROTEABRACKET"]             # ProteaBracket (L-foot included)
+        if alloc.get("S5_SOLARFOOT"):
+            rows[38] = alloc["S5_SOLARFOOT"]                 # SolarFoot
+            rows[39] = alloc["S5_SOLARFOOT"]                 # separate L-foot, 1 per SolarFoot
+        if len(alloc) > 1:
+            flags.append({"level": "NOTE", "item": "racking_mixed_attachments",
+                          "msg": f"Mixed attachment types routed per BOM table line: {alloc}."})
+        if att is None and alloc:
+            att = sum(alloc.values())
         if rails is not None:
             rows[45] = rails                                 # K2 CrossRail
         if splice is not None:
@@ -480,6 +517,17 @@ def _jbox_block(planset):
                              "25/26 manually from the roof plan."})
         return rows, flags
 
+    pbt = [p for p in (jb.get("planes_by_type") or []) if p.get("modules")]
+    if pbt:
+        # PER-PLANE roof type (mixed structures): shingle planes -> JB-1.2 row 25, all others -> JB-3 row 26
+        for p in pbt:
+            r = 25 if p["roof_type"] == "shingle" else 26
+            rows[r] = rows.get(r, 0) + max(1, math.ceil(int(p["modules"]) / 40))
+        flags.append({"level": "NOTE", "item": "jbox_count",
+                      "msg": "J-boxes per plane by roof type: " + ", ".join(
+                          f"{p['roof_type']} {p['plane']} ({p['modules']} mod)" for p in pbt)
+                             + f" -> {rows}."})
+        return rows, flags
     row, total = re_eng.f_jboxes_by_modules(mpp, roof_type)
     if total >= 1:
         rows[row] = total

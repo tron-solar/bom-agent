@@ -48,3 +48,51 @@ def test_gm_end_cap_wire_clip_filled_when_table_omits():  # Wright #918788 / She
 def test_gm_table_value_still_wins():
     rows, _, _ = k2_ground_mount({"4001370": 13, "4001221": 52, "4000069": 80}, False, 40)
     assert rows[78] == 52 and rows[83] == 80
+
+
+# ---- round 2: text-only disconnects, mixed roofs, MSP precedence ----
+import os
+from engine import text_tables as tt
+from engine.electrical_engine import main_service_panel_resolved
+
+_FX = os.path.join(os.path.dirname(__file__), "fixtures_bom_table.pdf")
+_FX_ROOF = os.path.join(os.path.dirname(__file__), "fixtures_roof_tables.pdf")
+
+
+def test_bom_table_disconnects_text_only():
+    rows, _ = tt.equipment_rows(_FX)
+    ac, dc = tt.disconnects_from_rows(rows)
+    assert [(d["amp"], d["fused"]) for d in ac] == [(60, False), (60, False)]   # wrapped PV/ESS label
+    assert sorted(d["poles"] for d in dc) == [2, 2, 4]
+
+
+def test_no_text_callout_means_no_disconnect():
+    assert tt.disconnects_from_callouts("AC DISCONNECT SHALL BE LOCKABLE\nSEE NOTE 4") == ([], [])
+
+
+def test_fused_callout_reads_disco_and_fuse_ratings():
+    ac, _ = tt.disconnects_from_callouts("(N) 60A FUSED AC DISCONNECT W/ (2) 40A FUSES")
+    assert ac[0]["amp"] == 60 and ac[0]["fused"] and ac[0]["fuse_amp"] == 40
+
+
+def test_existing_service_disconnect_excluded():                 # Latham #916365
+    ac, _ = tt.disconnects_from_callouts("(E) 200A MAIN SERVICE DISCONNECT\n(N) 60A NON-FUSED AC DISCONNECT")
+    assert [(d["amp"], d["fused"]) for d in ac] == [(60, False)]
+
+
+def test_mixed_attachments_per_type():                            # Head #976824 / Wyer #915365
+    rows, _ = tt.equipment_rows(_FX)
+    assert tt.attachments_from_rows(rows) == {"K2_SHINGLE": 32, "S5_PROTEABRACKET": 112}
+    assert tt.k2_attach_mounting(rows)["deck"] == 32
+
+
+def test_roof_planes_by_type_per_structure():
+    planes = tt.roof_planes_by_type(_FX_ROOF, 0)
+    assert [(p["roof_type"], p["modules"]) for p in planes] == [("shingle", 12), ("metal", 15), ("metal", 15)]
+
+
+def test_msp_master_note_wins_and_either_source_adds():
+    assert main_service_panel_resolved(False, None, "Upgrade to new MSP HOM4080M200PC")[0] == {77: 1}
+    assert main_service_panel_resolved(False, None, "Existing MSP can remain")[0] == {}
+    rows, flags, _ = main_service_panel_resolved(True, "HOM3060M200PC", "New MSP HOM4080M200PC")
+    assert rows == {77: 1} and any(f["item"] == "msp_note_vs_plan" for f in flags)
