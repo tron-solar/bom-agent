@@ -301,6 +301,15 @@ def master_notes_from_coperniq(project=None, form=None):
     return out
 
 
+def _note_says_stack(t: str) -> bool:
+    """Stack kit only on an EXPLICIT call-out: the stack kit P/N 1978070, or the words 'stack kit' /
+    'stacked' / 'stack mount'. A bare 'stack' substring elsewhere in the note (user, Fickas #857566)
+    must not flip the default WALL kit."""
+    t = (t or "").lower()
+    return ("1978070" in t.replace(" ", "") or "stack kit" in t or "stacked" in t
+            or "stack mount" in t or "stack-mount" in t)
+
+
 def resolve_expansion_mount(plan_mount=None, master_notes=None):
     """
     Determine expansion mount kit (stack vs wall) by PRECEDENCE (user, Lackey):
@@ -329,7 +338,7 @@ def resolve_expansion_mount(plan_mount=None, master_notes=None):
         else:
             text = str(master_notes)
         t = text.lower()
-        if "stack" in t:
+        if _note_says_stack(t):
             return "stack"
         if "wall mount" in t or "wall-mount" in t or "wallmount" in t:
             return "wall"
@@ -488,6 +497,15 @@ def meter_socket(new_meter_drawn, meter_pn=None):
             flags.append({"level": "NOTE", "item": "meter_pn_normalized",
                           "detail": f"U6281 meter P/N {str(meter_pn).strip()!r} normalized -5T9- -> "
                                     f"-5T6- (catalog SKU) to match meter row {row}."})
+    # U9551 family (user, Wells #873390 / Bolin #858290 / Alderson #953390 / Wyer #915365): plansets
+    # often omit the -5T9- token ("U9551-RXL-QG-AMS"). Tron's ONLY U9551 SKU is the Ameren lever-bypass
+    # U9551-RXL-QG-5T9-AMS (row 89), so a U9551 P/N that misses verbatim resolves to row 89 by FAMILY,
+    # never to Special Order. Applied only after a direct miss.
+    if row is None and key.replace(" ", "").startswith("U9551"):
+        row = norm_table.get("U9551-RXL-QG-5T9-AMS")
+        flags.append({"level": "NOTE", "item": "meter_pn_normalized",
+                      "detail": f"U9551 meter P/N {str(meter_pn).strip()!r} resolved to the Ameren "
+                                f"lever-bypass U9551-RXL-QG-5T9-AMS (row {row}); plan omitted -5T9-."})
     if row is None:
         pn = str(meter_pn).strip()
         rows[_METER_SPECIAL_ORDER_ROW] = 1
@@ -680,6 +698,32 @@ def tesla_expansion(unit_count, harness_pn=None, mount=None):
     return rows, flags
 
 
+_HARNESS_ROW = {"-05": 63, "-20": 64, "-40": 65}
+
+
+def expansion_allocation_from_note(note_text, unit_count):
+    """PER-UNIT expansion mount + harness allocation from the Master Note (user, Murphy #852366:
+    'First PW3 Expansion installed with stack kit (1978070) ... harness (1875157-05-y)' / 'Second PW3
+    Expansion ... wall mount kit (1978069-00-x) and harness (1875157-20-y)' -> 1 stack + 1 wall,
+    1x -05 + 1x -20 — NOT 2 stacks + 2x -05).
+
+    Counts explicit kit P/Ns (1978070 stack, 1978069 wall) and harness P/Ns (1875157-05/-20/-40) in the
+    note. Returns ({"mount": {61: n, 62: m}, "harness": {63: a, 64: b, 65: c}}) for whichever side
+    sums EXACTLY to unit_count, else {} for that side (caller falls back to the single-value path)."""
+    out = {}
+    if not note_text or unit_count <= 0:
+        return out
+    t = str(note_text).upper().replace(" ", "")
+    stack_n = t.count("1978070")
+    wall_n = t.count("1978069")
+    if stack_n + wall_n == unit_count and stack_n + wall_n > 0:
+        out["mount"] = {k: v for k, v in ((61, stack_n), (62, wall_n)) if v}
+    h = {row: t.count(f"1875157{suf}") for suf, row in _HARNESS_ROW.items()}
+    if sum(h.values()) == unit_count:
+        out["harness"] = {k: v for k, v in h.items() if v}
+    return out
+
+
 def tesla_expansion_resolved(unit_count, plan_harness_pn, project_id,
                              mcp_list_project_forms, mcp_get_form, plan_mount=None):
     """End-to-end expansion resolution. PLANS AUTHORITATIVE, Master Note is a CHECK (user, Nelson).
@@ -739,7 +783,7 @@ def tesla_expansion_resolved(unit_count, plan_harness_pn, project_id,
         # if note explicitly disagrees with a plan-stated mount, NOTE it (plan wins)
         note_says = None
         t = note_text.lower()
-        if "stack" in t:
+        if _note_says_stack(t):
             note_says = "stack"
         elif "wall mount" in t or "wall-mount" in t or "wallmount" in t:
             note_says = "wall"
@@ -751,6 +795,28 @@ def tesla_expansion_resolved(unit_count, plan_harness_pn, project_id,
         resolved_mount = note_mount  # note or default wall
 
     rows, ef = tesla_expansion(unit_count, harness_pn=plan_harness_pn, mount=resolved_mount)
+
+    # --- PER-UNIT allocation (mixed stack + wall, mixed harness lengths) from the Master Note ---
+    # The single-value path above applies ONE mount + ONE harness to every unit. When the note gives
+    # an explicit per-unit split that sums to unit_count, deliver that split instead.
+    alloc = expansion_allocation_from_note(note_text, unit_count)
+    if "mount" in alloc and not plan_mount:
+        for r in (61, 62):
+            rows.pop(r, None)
+        rows.update(alloc["mount"])
+    if "harness" in alloc and len(alloc["harness"]) > 1:
+        # mixed harness lengths can't be expressed by the single one-line P/N -> note split wins
+        for r in (63, 64, 65):
+            rows.pop(r, None)
+        rows.update(alloc["harness"])
+        ef = [f for f in ef if f.get("item") not in ("expansion_harness_pn_missing",
+                                                     "expansion_harness_pn_unrecognized")]
+        flags.append({"level": "NOTE", "item": "expansion_harness_split",
+                      "detail": f"Master Note specifies mixed harness lengths per unit {alloc['harness']}; "
+                                f"delivered the split (plan one-line P/N {plan_harness_pn!r})."})
+    elif "harness" in alloc and not plan_harness_pn:
+        rows.update(alloc["harness"])
+        ef = [f for f in ef if f.get("item") != "expansion_harness_pn_missing"]
     return rows, flags + ef
 
 

@@ -375,6 +375,23 @@ def k2_ground_mount(bom_table, has_enphase_micros, module_count):
             flags.append({"level": "WARN", "item": "gm_line_unmapped",
                           "detail": f"K2 GM BOM line {key!r} (qty {qty}) has no template row"})
 
+    # Rule 5b — GAP FILL (user, Wright #918788 / Shewmake #967703): the table value is TRUTH when the
+    # PV-3.1 table prints the line, but many K2 GM table exports OMIT end caps and wire clips. An
+    # omitted line must not leave the BOM empty: fill ONLY when absent, with a NOTE.
+    #   end cap (row 78)   = total GM rail pieces (rows 73+74) * 2  (one cap per rail end)
+    #   wire clip (row 83) = module_count * 2
+    rail_pcs = rows.get(73, 0) + rows.get(74, 0)
+    if 78 not in rows and rail_pcs:
+        rows[78] = rail_pcs * 2
+        flags.append({"level": "NOTE", "item": "gm_end_cap_computed",
+                      "detail": f"PV-3.1 table has no End Cap line; delivered rails({rail_pcs})*2 = "
+                                f"{rows[78]} on row 78. Verify against the plan."})
+    if 83 not in rows and module_count:
+        rows[83] = int(module_count) * 2
+        flags.append({"level": "NOTE", "item": "gm_wire_clip_computed",
+                      "detail": f"PV-3.1 table has no Wire Clip line; delivered modules({module_count})*2 "
+                                f"= {rows[83]} on row 83. Verify against the plan."})
+
     return rows, overrides, flags
 
 

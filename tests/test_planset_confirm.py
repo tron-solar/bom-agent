@@ -52,11 +52,22 @@ def test_extra_words_not_matched():
 
 
 def test_middle_name_customer():
+    # REVERSED (user, Hicks #888564): middle names are part of the homeowner's name and must match.
     files = [_pdf("Joseph Michael Dare REVA.pdf")]
-    # "Joseph ... Dare" — first+last tokens; middle word breaks the strict pattern by design.
-    # Confirm it does NOT match (so we never silently accept a differently-formatted name).
+    assert select_planset(files, "Joseph Michael Dare").revision == "A"
+
+
+def test_title_suffix_and_middle_initial():
+    # Coperniq titles carry '#N' suffixes (Collins #856179, Harris #934388); Master Note uses initials.
+    assert select_planset([_pdf("Curtis Collins REVA.pdf")], "Curtis Collins #2").revision == "A"
+    assert select_planset([_pdf("James Harris REVA.pdf")], "James Harris #1").revision == "A"
+    assert select_planset([_pdf("Roland Wayne Hicks REVA.pdf")], "Roland Wayne Hicks").revision == "A"
+    assert select_planset([_pdf("Tamara N Murphy REVB.pdf")], "Tamara Murphy").revision == "B"
+
+
+def test_extra_words_still_rejected():
     with pytest.raises(PlansetNotConfirmed):
-        select_planset(files, "Joseph Michael Dare")
+        select_planset([_pdf("Joseph Dare CAD REV A.pdf")], "Joseph Dare")
 
 
 def _pdf_sz(name, size, fid, created, url="http://x"):

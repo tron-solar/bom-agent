@@ -764,10 +764,12 @@ class PlansetExtractor:
                                   "GROUND SCREW", "PIPE BRACKET", "PIPE - BRACKET", "N/S PIPE"))
                 or any(pn in U for pn in ("4001370", "4000198", "4000175", "4001221", "4000708"))):
             return "ground", "K2_GROUND"
-        if "PROTEABRACKET" in U or "PROTEA" in U or "S-5" in U or "STANDING SEAM" in U:
-            return "roof", "S5_PROTEABRACKET"
+        # SolarFoot FIRST: its label is "S-5! SOLARFOOT", so the generic "S-5" test below would
+        # otherwise misclassify every SolarFoot job as ProteaBracket.
         if "SOLARFOOT" in U or "SOLAR FOOT" in U:
             return "roof", "S5_SOLARFOOT"
+        if "PROTEABRACKET" in U or "PROTEA" in U or "S-5" in U or "STANDING SEAM" in U:
+            return "roof", "S5_PROTEABRACKET"
         if any(t in U for t in ("MULTIMOUNT", "MULTI MOUNT", "MULTI-MOUNT", "SHINGLE", "4000282", "4000819")):
             return "roof", "K2_SHINGLE"
         return "roof", None
@@ -795,7 +797,9 @@ class PlansetExtractor:
                 out["end_clamps"] = qty
             elif "MODULE CLAMP" in label or ("MID" in L and "CLAMP" in L):
                 out["mid_clamps"] = qty
-            elif "ATTACHMENT" in label or "MULTIMOUNT" in L:
+            elif ("PROTEA" in L or "SOLARFOOT" in L or "SOLAR FOOT" in L
+                  or (("ATTACHMENT" in label or "MULTIMOUNT" in L)
+                      and "L FOOT" not in L and "L-FOOT" not in L)):
                 out["attachments"] = qty
             elif label.startswith("RAIL") or "CROSSRAIL" in L:
                 out["rails"] = qty
@@ -1076,7 +1080,9 @@ class PlansetExtractor:
                 out["end_clamps"] = qty
             elif "MID" in U or "MODULE CLAMP" in U:
                 out["mid_clamps"] = qty
-            elif "ATTACHMENT" in U or "MULTIMOUNT" in U:
+            elif ("PROTEA" in U or "SOLARFOOT" in U or "SOLAR FOOT" in U
+                  or (("ATTACHMENT" in U or "MULTIMOUNT" in U)
+                      and "L FOOT" not in U and "L-FOOT" not in U)):
                 out["attachments"] = qty
             elif "RAIL" in U or "CROSSRAIL" in U:
                 out["rails"] = qty
@@ -1375,6 +1381,31 @@ class PlansetExtractor:
         resolved_pw3 = next((v for v in (src1, src3, src2) if v is not None), None)
         if resolved_pw3 is None:
             resolved_pw3 = cover_data.get("battery_quantity")
+        # PV-ONLY GUARD (user, Trumbo #972103 / Stodola #914328 / Lindenlaub #975867): if NO planset
+        # text (PV-5 + PV-3) names a Powerwall 3 / 1707000 at all, there is no battery. A Vision
+        # cover/drawn read alone must not invent PW3s — that phantom count drove 3 IMO RSD switches
+        # (ceil(8/3)) and 8 BR260 breakers onto a PV-only BOM.
+        _plan_txt = (self._page_text(pdf_path, pv5_page) + " " + self._page_text(pdf_path, pv3_page)
+                     + " " + self._page_text(pdf_path, 0)).upper()
+        _pw3_in_text = ("POWERWALL" in _plan_txt or "1707000" in _plan_txt)
+        if src1 is None and src3 is None and not _pw3_in_text and _plan_txt.strip():
+            if resolved_pw3:
+                extraction_flags.append({
+                    "level": "NOTE", "item": "pw3_suppressed_pv_only",
+                    "msg": f"No Powerwall/1707000 text anywhere on PV-1/PV-3/PV-5; Vision/cover read "
+                           f"{resolved_pw3} PW3 — treated as PV-only (0 PW3, no RSD switch/BR260)."})
+            resolved_pw3 = 0
+            cover_data["battery_quantity"] = 0
+        # TESLA INVERTER GUARD (user, Frederick #916731 / Moore #954275 / Gordon #973198): a standalone
+        # Tesla Solar Inverter is delivered only if the plan TEXT names one (1538000 / 'SOLAR INVERTER'
+        # with TESLA). Vision alone can mistake the PW3's integrated inverter for a separate unit.
+        if electrical_data.get("inverter_sku") and _plan_txt.strip():
+            if not ("1538000" in _plan_txt or ("TESLA" in _plan_txt and "SOLAR INVERTER" in _plan_txt)):
+                extraction_flags.append({
+                    "level": "NOTE", "item": "inverter_suppressed",
+                    "msg": f"Vision read Tesla inverter {electrical_data.get('inverter_sku')!r} but no "
+                           f"plan text names a Tesla Solar Inverter (1538000); not delivered."})
+                electrical_data["inverter_sku"] = None
         if present and len(set(present)) > 1:
             extraction_flags.append({
                 "level": "HARD", "item": "equipment_count_mismatch",
@@ -1602,9 +1633,7 @@ class PlansetExtractor:
                        f"PV-3 ({mci_pv3}) as truth; verify which is correct."})
         elif mci is not None:
             if mci_pv3 is not None and mci_pv1 is not None:
-                extraction_flags.append({
-                    "level": "NOTE", "item": "mci_count",
-                    "msg": f"Tesla MCI-2 = {mci} (PV-3 BOM and PV-1 SCOPE agree)."})
+                pass   # sources AGREE -> no flag (user, Howell #857902: a match is not a review item)
             else:
                 only = "PV-3 BOM" if mci_pv3 is not None else "PV-1 SCOPE"
                 extraction_flags.append({

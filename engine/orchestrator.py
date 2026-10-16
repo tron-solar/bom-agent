@@ -128,7 +128,11 @@ def _build_blocks(planset, project: dict):
         _run_block("s_clips", flags, solar_rows, lambda: ({30: re_eng.f_s_clip(_mc)}, []))
 
     # --- RSD device (Electrical row 19) = ceil(batteries/3); PW3 expansion excluded ---
-    battery_count = int(planset.battery_quantity or 0)
+    # Battery count = the RECONCILED PW3 count (PV-5 text -> PV-3 text -> drawn, with the PV-only guard),
+    # NOT the raw cover read — a misread cover put IMO RSD switches on PV-only jobs (Trumbo/Stodola).
+    _elec0 = getattr(planset, "electrical", None) or {}
+    _pw3c = _elec0.get("pw3_count")
+    battery_count = int(_pw3c) if isinstance(_pw3c, int) else int(planset.battery_quantity or 0)
     _run_block("rsd_device", flags, elec_rows, lambda: ee.rsd_device(battery_count))
 
     # ===== PV-5 ELECTRICAL BLOCKS (driven by extractor.PlansetData.electrical) =====
@@ -393,15 +397,27 @@ def _racking_block(planset):
                           "msg": f"K2 GM BOM line not mapped to a template row: {u}. Verify/add it."})
         return rows, flags, overrides
 
-    # --- K2 SHINGLE ROOF (rows 33-52) — planset table authoritative ---
-    if at == "K2_SHINGLE":
+    # --- ROOF (rows 33-52) — planset table authoritative. K2 shingle AND S-5! metal share the K2
+    # CrossRail/clamp/splice/endcap/lug/clip rows (45-52); only the ATTACHMENT rows differ:
+    #   K2_SHINGLE       -> row 33 Multimount + row 46 rail clamp (1/attach) + row 35 deck screws (4/attach)
+    #   S5_PROTEABRACKET -> row 37 (ships WITH L-foot: no row 39, no 46, no deck/lag screws)
+    #   S5_SOLARFOOT     -> row 38 + row 39 L-foot (1/attach; PV-14: L-foot NOT included), no screws
+    # (user, Wilson #877515 / Murphy #852366 / Franklin #852401 / Pons #853892 / Howell #857902:
+    #  S-5! was previously HARD-flagged 'not auto-routed', leaving the whole roof block empty.)
+    if at in ("K2_SHINGLE", "S5_PROTEABRACKET", "S5_SOLARFOOT"):
         roof = rk.get("roof") or {}
         att, rails, splice = roof.get("attachments"), roof.get("rails"), roof.get("splice")
         mid, ends = roof.get("mid_clamps"), roof.get("end_clamps")
         if att is not None:
-            rows[33] = att                                   # K2 Multimount shingle attachment
-            rows[46] = att                                   # K2 rail clamp = attachment qty (truth)
-            rows[35] = re_eng.f_deck_screw(att)              # deck screw = 4*attach (default; lag row 34 alt)
+            if at == "K2_SHINGLE":
+                rows[33] = att                               # K2 Multimount shingle attachment
+                rows[46] = att                               # K2 rail clamp = attachment qty (truth)
+                rows[35] = re_eng.f_deck_screw(att)          # deck screw = 4*attach (default; lag row 34 alt)
+            elif at == "S5_PROTEABRACKET":
+                rows[37] = att                               # ProteaBracket (L-foot included)
+            else:                                            # S5_SOLARFOOT
+                rows[38] = att                               # SolarFoot
+                rows[39] = att                               # separate L-foot, 1 per SolarFoot
         if rails is not None:
             rows[45] = rails                                 # K2 CrossRail
         if splice is not None:
@@ -431,10 +447,10 @@ def _racking_block(planset):
         flags += _racking_orientation_crosscheck(rk)
         return rows, flags, overrides
 
-    # --- S-5! metal / unrecognized — read but not auto-routed (don't guess) ---
+    # --- unrecognized attachment — read but not auto-routed (don't guess) ---
     flags.append({"level": "HARD", "item": "racking_attachment_unrouted",
-                  "msg": f"Racking attachment type {at!r} (system {system!r}) is not auto-routed yet "
-                         f"(K2 shingle and K2 ground are wired; S-5! metal pending validation). "
+                  "msg": f"Racking attachment type {at!r} (system {system!r}) is not auto-routed "
+                         f"(K2 shingle, S-5! ProteaBracket/SolarFoot and K2 ground are wired). "
                          f"Table read: {rk.get('roof') or rk.get('ground_bom_table')}. Populate manually."})
     return rows, flags, overrides
 
@@ -495,10 +511,17 @@ def _missing_input_flags(planset) -> list[dict]:
                                  "deferred: its special-order format writes distinct B/C and needs a "
                                  "bom_writer change"),
     ]
+    # Only raise these when the planset actually involves them (user, Howell #857902: a micro / Homeline
+    # soft flag on a project that never mentions micros or Homeline is noise).
+    has_micros = bool((getattr(planset, "racking", None) or {}).get("has_enphase")) or "ENPHASE" in \
+        str(getattr(planset, "module_model", "") or "").upper() or bool(getattr(planset, "has_enphase", False))
+    elec = getattr(planset, "electrical", None) or {}
+    has_homeline = "HOM" in str(elec.get("msp_pn") or "").upper() or "HOMELINE" in str(elec).upper()
+    relevant = {"micro_accessories": has_micros, "homeline_msp_breaker": has_homeline}
     return [{"level": "NOTE", "item": f"extractor_missing:{item}",
              "msg": f"Not auto-populated — the v2 extractor's PlansetData does not surface {what}. "
                     f"Human must add this line; or enrich extractor.PlansetData with this field."}
-            for item, what in needed]
+            for item, what in needed if relevant.get(item)]
 
 
 def _normalize_flags(flags: list[dict]) -> list[dict]:

@@ -93,29 +93,75 @@ def _stem(filename: str) -> str:
 
 
 # ---------- core matcher ----------
-def _convention_match(filename: str, first: str, last: str) -> bool:
-    """True iff the filename stem is exactly the customer's name followed by a REV<L> token.
-    Tolerant of separators/case/extra spaces, but NOT of extra words (so 'Joseph Dare CAD REV A'
-    does NOT match — only 'Joseph Dare REV A')."""
-    stem_norm = _norm(_stem(filename))            # e.g. "joseph dare rev a"
+_NAME_NOISE = {"and", "jr", "sr", "ii", "iii", "iv", "mr", "mrs", "ms", "dr"}
+
+
+def _name_tokens(customer_name: str) -> list[str]:
+    """Customer-name tokens with project-title noise removed. Coperniq titles carry suffixes that are
+    NOT part of the homeowner's name ("Curtis Collins #2", "Jane Doe (PV)", "John & Jane Smith"):
+    drop purely numeric tokens, parenthetical tags, '#N' suffixes, and honorific/suffix words."""
+    s = re.sub(r"\(.*?\)", " ", customer_name or "")        # (PV), (ESS)...
+    s = re.sub(r"#\s*\d+", " ", s)                           # #2
+    toks = [t for t in _norm(s).split() if t and not t.isdigit() and t not in _NAME_NOISE]
+    return toks
+
+
+def _split_stem(filename: str) -> tuple[str, str]:
+    """Split a filename stem into (name_part_normalized, rev_letter). The REV token must be the LAST
+    token (REVA / REV A / REV-A / REV_A). Returns ('', '') if no trailing REV token."""
+    stem_norm = _norm(_stem(filename))
+    m = re.match(r"^(.*?)\s*\brev\s*([a-z])$", stem_norm)
+    if not m:
+        return "", ""
+    return m.group(1).strip(), m.group(2)
+
+
+def _convention_match(filename: str, first: str, last: str, all_tokens: list[str] | None = None) -> bool:
+    """True iff the filename is '<homeowner name> REV<L>.pdf' for THIS customer.
+
+    Structural rules (user, Hicks #888564 / Collins #856179 / Harris #934388):
+      - name part must contain the customer's FIRST and LAST name tokens, in order;
+      - MIDDLE names/initials are allowed in either the title or the filename ("Roland Wayne Hicks",
+        "Tamara N Murphy"), as are title suffixes ("#2") that are stripped before matching;
+      - every filename name-token must belong to the customer's name (so 'Joseph Dare CAD REV A'
+        still does NOT match — extra non-name words are rejected);
+      - small typos tolerated per token (difflib ratio >= 0.85) so 'Jon' vs 'John' near-misses pass.
+    Content confirmation (PV-1 homeowner name/address) remains the second-stage check."""
+    import difflib
+    name_part, rev = _split_stem(filename)
+    if not rev or not name_part:
+        return False
     first_n, last_n = _norm(first), _norm(last)
     if not first_n or not last_n:
         return False
-    # expected: "<first> <last> rev <L>"  (rev letter optional in the regex, required overall)
-    pat = rf"^{re.escape(first_n)}\s+{re.escape(last_n)}\s+rev\s*([a-z])$"
-    return re.match(pat, stem_norm) is not None
+    cust = set(all_tokens or [first_n, last_n])
+    ftoks = [t for t in name_part.split() if t not in _NAME_NOISE]
+
+    def close(a, b):
+        return a == b or (len(a) > 3 and difflib.SequenceMatcher(None, a, b).ratio() >= 0.85)
+
+    # every filename token must be part of the customer's name (no extra words like CAD/FINAL)
+    if not all(any(close(t, c) for c in cust) or len(t) == 1 for t in ftoks):
+        return False
+    try:
+        i_first = next(i for i, t in enumerate(ftoks) if close(t, first_n))
+        i_last = max(i for i, t in enumerate(ftoks) if close(t, last_n))
+    except (StopIteration, ValueError):
+        return False
+    return i_first < i_last
 
 
 def _split_name(customer_name: str) -> tuple[str, str]:
-    parts = _norm(customer_name).split()
+    parts = _name_tokens(customer_name)
     if len(parts) < 2:
         return (customer_name.strip(), "")
-    # First token = first name, last token = last name (handles middle names/initials)
+    # First token = first name, last token = last name (middle names/initials allowed in between)
     return parts[0], parts[-1]
 
 
 def build_candidates(files: list[dict], customer_name: str) -> list[PlansetCandidate]:
     first, last = _split_name(customer_name)
+    all_toks = _name_tokens(customer_name)
     cands: list[PlansetCandidate] = []
     for f in files:
         if f.get("isArchived"):
@@ -125,7 +171,7 @@ def build_candidates(files: list[dict], customer_name: str) -> list[PlansetCandi
             continue
         is_pdf = _is_pdf(f)
         rev = revision_letter(name)
-        match = _convention_match(name, first, last) if is_pdf else False
+        match = _convention_match(name, first, last, all_toks) if is_pdf else False
         c = PlansetCandidate(file=f, name=name, revision=rev, rev_index=_rev_index(rev),
                              name_match=match, is_pdf=is_pdf)
         # scoring is for DIAGNOSTICS/soft-fallback only; selection uses name_match strictly
