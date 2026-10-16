@@ -119,7 +119,9 @@ def _build_blocks(planset, project: dict):
 
     # --- Module line (Solar rows 5-9) ---
     _run_block("solar_module", flags, solar_rows,
-               lambda: ee.solar_module(planset.module_model, planset.module_quantity), solar_special)
+               lambda: ee.solar_module(planset.module_model, planset.module_quantity,
+                                       ((getattr(planset, "electrical", None) or {}).get("master_note_text") or "")),
+               solar_special)
 
     # --- S-clips (Solar row 30) = module_count * 6, written as a STATIC int. The template ships A30 as
     # '=IF(...)*6', which Coperniq's un-recalced viewer shows BLANK; writing the computed integer fixes

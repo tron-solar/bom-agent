@@ -270,3 +270,20 @@ def test_table_fallback_when_oneline_silent():
     assert tt.select_disconnects(tab_ac, tab_dc, [], []) == (tab_ac, tab_dc)
     co_ac = [{"amp": 30, "fused": True}]
     assert tt.select_disconnects(tab_ac, tab_dc, co_ac, [])[0] is co_ac
+
+
+# ---- modules: HiS -> HiN (row 7), Q.TRON 435W (row 10) ----
+def test_hyundai_his_flips_to_hin_row7():
+    for pn in ("HiS-T440NF(BK)", "HiN-T440NF(BK)", "HYUNDAI HiN-T440NF(BK) 440W"):
+        rows, _, sp = _ee.solar_module(pn, 30)
+        assert rows == {7: 30} and sp[7][0] == "HiN-T440NF(BK)"
+
+
+def test_qtron_435_row10_stamped():
+    rows, flags, sp = _ee.solar_module("Q.TRON BLK M-G2.C+ 435W", 28, "28x QCELLS Q.TRON BLK M-G2.C+ 435W")
+    assert rows == {10: 28} and sp[10] == ("Q.TRON BLK M-G2.C+ 435W", "QCELLS 435W MODULES") and not flags
+
+
+def test_module_master_note_mismatch_is_hard():
+    _, flags, _ = _ee.solar_module("Q.TRON BLK M-G2.C+ 435W", 28, "(28) SIRIUS ELNSM54M-HC-N-450")
+    assert any(f["item"] == "module_plan_vs_master_note" and f["level"] == "HARD" for f in flags)

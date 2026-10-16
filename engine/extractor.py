@@ -606,7 +606,7 @@ class PlansetExtractor:
     # PV-3 read; this table only drives a NOTE on disagreement.
     _MODULE_DIMS_BY_SKU = [
         (("ELNSM54M", "SIRIUS"), (67.80, 44.65)),
-        (("HIS-T440", "HYUNDAI"), (67.80, 44.65)),
+        (("HIS-T440", "HIN-T440", "HYUNDAI"), (67.80, 44.65)),
         (("LR5-54", "LONGI"), (67.80, 44.65)),
         (("DNA-120", "APTOS"), (74.90, 44.60)),
     ]

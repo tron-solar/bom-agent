@@ -360,12 +360,20 @@ _MODULE_SKU_ROW = {
     "HIS-T440NF(BK)":             7,   # 440W Hyundai
     "DNA-120-BF10-460W":          8,   # 460W Aptos
     "LR5-54HPB-415M":             9,   # 415W LonGi
+    "HIN-T440NF(BK)":             7,   # 440W Hyundai — the ONLY Hyundai 440 SKU Tron sources (user, 2026-10-16)
+    "Q.TRON BLK M-G2.C+ 435W":   10,   # 435W Qcells Q.TRON (user, 2026-10-16) — template row 10 is blank
+}
+# Row SKU/description stamped by the engine (B, C). Row 7: plans may say HiS-T440NF(BK) or HiN-T440NF(BK);
+# Tron only sources HiN, so the delivered line always reads HiN. Row 10 is blank in the template.
+_MODULE_ROW_STAMP = {
+    7:  ("HiN-T440NF(BK)", "440W HYUNDAI MODULES"),
+    10: ("Q.TRON BLK M-G2.C+ 435W", "QCELLS 435W MODULES"),
 }
 # CONFIRMED substitutions (user-authorized): plan SKU -> (template row, substitute SKU, reason).
 # Carmen Meyer #877571: the Hyundai HiS-T430NF(BK) 430W is flipped to the 440W version of the SAME
 # module SKU (row 7). User confirmed this substitution explicitly. Add future confirmed swaps here.
 _MODULE_CONFIRMED_SUB = {
-    "HIS-T430NF(BK)": (7, "HiS-T440NF(BK)", "430W flipped to 440W version of same module (user-confirmed)"),
+    "HIS-T430NF(BK)": (7, "HiN-T440NF(BK)", "430W flipped to the 440W HiN-T440NF(BK) (user-confirmed)"),
 }
 
 
@@ -385,45 +393,78 @@ def _norm_module_sku(s) -> str:
     return s
 
 
-def solar_module(module_pn, module_count):
-    """Solar module line (Solar BOM rows 5-9). Returns (rows, flags).
+def _module_row(key):
+    """Exact normalized match, else the planset string CONTAINS a table SKU (e.g. 'QCELLS Q.TRON BLK
+    M-G2.C+ 435W' or 'HYUNDAI HIN-T440NF(BK)'). Only SKUs >= 8 normalized chars are used for containment so
+    a short token can't match by accident; the longest contained SKU wins."""
+    table = {_norm_module_sku(k): v for k, v in _MODULE_SKU_ROW.items()}
+    if key in table:
+        return table[key]
+    hits = [(len(k), v) for k, v in table.items() if len(k) >= 8 and k in key]
+    return max(hits)[1] if hits else None
 
-    module_pn    : EXACT module model from the planset (e.g. "HiS-T430NF(BK)").
+
+def module_note_crosscheck(module_pn, note_text):
+    """Master Note vs plan module (user, Q.TRON rule: 'if it matches the plans and master note'). Returns a
+    flag list: HARD if the note names a DIFFERENT template module than the plan; [] if it agrees or is
+    silent."""
+    if not note_text or not module_pn:
+        return []
+    plan_row = _module_row(_norm_module_sku(module_pn))
+    T = re.sub(r"[\s\-]+", "", str(note_text).upper())
+    note_rows = {v for k, v in _MODULE_SKU_ROW.items() if _norm_module_sku(k) in T}
+    if note_rows and plan_row is not None and plan_row not in note_rows:
+        return [{"level": "HARD", "item": "module_plan_vs_master_note",
+                 "detail": f"Plan module {module_pn!r} (row {plan_row}) differs from the Master Note "
+                           f"module (row(s) {sorted(note_rows)}). Confirm which module is being installed."}]
+    return []
+
+
+def solar_module(module_pn, module_count, note_text=""):
+    """Solar module line (Solar BOM rows 5-10). Returns (rows, flags, special).
+
+    module_pn    : EXACT module model from the planset (e.g. "HiS-T440NF(BK)").
     module_count : module quantity (from the PV-3 BOM table / count).
+    note_text    : Master Note text, cross-checked against the plan module.
 
-    Exact table match -> {row: count}. Confirmed substitution -> {sub_row: count} + NOTE recording
-    the swap. Unmapped with no confirmed sub -> HARD flag, no row placed (human adds the SKU).
-    Matching is case/space-normalized, hyphens kept. NEVER a blind family/wattage guess.
+    Exact (or contained) table match -> {row: count}; rows 7 and 10 also stamp their SKU/description
+    (row 7 always HiN-T440NF(BK); row 10 Q.TRON). Confirmed substitution -> {sub_row: count} + NOTE.
+    Unmapped with no confirmed sub -> HARD flag, no row placed. NEVER a blind family/wattage guess.
     """
     rows: dict[int, int] = {}
     flags: list = []
+    special: dict = {}
     if not module_pn:
         flags.append({"level": "HARD", "item": "module_pn_missing",
                       "detail": "No module model read from the planset. Transcribe the exact module "
                                 "SKU from PV-3 / PV-7; do not guess."})
-        return rows, flags
+        return rows, flags, special
 
     key = _norm_module_sku(module_pn)
+    row = _module_row(key)
+    if row is None:
+        subs = {_norm_module_sku(k): v for k, v in _MODULE_CONFIRMED_SUB.items()}
+        if key in subs:
+            sub_row, sub_sku, reason = subs[key]
+            row = sub_row
+            flags.append({"level": "NOTE", "item": "module_substitution",
+                          "msg": (f"Planset module {module_pn!r} is not a template SKU; placed on row "
+                                  f"{sub_row} ({sub_sku}) per confirmed substitution: {reason}.")})
+    if row is None:
+        flags.append({"level": "HARD", "item": "module_pn_unmapped",
+                      "detail": (f"Planset module {module_pn!r} is not in the module table (rows 5-10) and "
+                                 f"has no confirmed substitution. HOLD — a human must add the SKU/row or "
+                                 f"authorize a substitution. NOT placed on a close-wattage row.")})
+        return rows, flags, special
 
-    table = {_norm_module_sku(k): v for k, v in _MODULE_SKU_ROW.items()}
-    if key in table:
-        rows[table[key]] = int(module_count)
-        return rows, flags
-
-    subs = {_norm_module_sku(k): v for k, v in _MODULE_CONFIRMED_SUB.items()}
-    if key in subs:
-        sub_row, sub_sku, reason = subs[key]
-        rows[sub_row] = int(module_count)
-        flags.append({"level": "NOTE", "item": "module_substitution",
-                      "msg": (f"Planset module {module_pn!r} is not a template SKU; placed on row "
-                              f"{sub_row} ({sub_sku}) per confirmed substitution: {reason}.")})
-        return rows, flags
-
-    flags.append({"level": "HARD", "item": "module_pn_unmapped",
-                  "detail": (f"Planset module {module_pn!r} is not in the module table (rows 5-9) and "
-                             f"has no confirmed substitution. HOLD — a human must add the SKU/row or "
-                             f"authorize a substitution. NOT placed on a close-wattage row.")})
-    return rows, flags
+    rows[row] = int(module_count)
+    if row in _MODULE_ROW_STAMP:
+        special[row] = _MODULE_ROW_STAMP[row]
+    if row == 7 and "HIS" in key and not any(f.get("item") == "module_substitution" for f in flags):
+        flags.append({"level": "NOTE", "item": "module_his_to_hin",
+                      "msg": f"Plan module {module_pn!r} delivered as HiN-T440NF(BK) (the only Hyundai 440 SKU sourced)."})
+    flags += module_note_crosscheck(module_pn, note_text)
+    return rows, flags, special
 
 
 # ---------- Meter socket / base (Electrical rows 81-96) ----------
