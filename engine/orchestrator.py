@@ -472,6 +472,12 @@ def _racking_block(planset):
         att, rails, splice = roof.get("attachments"), roof.get("rails"), roof.get("splice")
         mid, ends = roof.get("mid_clamps"), roof.get("end_clamps")
         alloc = dict(by_type) if by_type else ({at: att} if att is not None else {})
+        if att is not None and alloc:
+            if len(alloc) == 1:
+                alloc = {next(iter(alloc)): att}       # one type: racking-table attachment qty is TRUTH
+            elif sum(alloc.values()) != att and roof.get("attachments_total") is not None:
+                flags.append({"level": "HARD", "item": "racking_attachment_sum_mismatch",
+                              "msg": f"Per-type attachments {alloc} don't sum to the table total {att}."})
         k2 = alloc.get("K2_SHINGLE")
         if k2:
             rows[33] = k2                                    # K2 Multimount shingle attachment

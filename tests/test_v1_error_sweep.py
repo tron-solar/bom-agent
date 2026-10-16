@@ -149,3 +149,24 @@ def test_mpu_without_sku_defaults_row_76():
 def test_attachment_callouts_without_bom_table():
     assert tt.attachments_from_callouts("(112) S-5! PROTEA BRACKET\nATTACHMENTS\n(32) K2 MULTIMOUNT "
                                         "ATTACHMENTS (DECK MOUNTED)") == {"S5_PROTEABRACKET": 112, "K2_SHINGLE": 32}
+
+
+# ---- Moyes #971010 (real PV-3): ProteaBracket delivered 74 vs plan 61 ----
+_FX_MOYES = os.path.join(os.path.dirname(__file__), "fixtures_moyes_971010_pv3.pdf")
+
+
+def test_moyes_bom_table_stops_before_roof_description():
+    rows, _ = tt.equipment_rows(_FX_MOYES)
+    assert tt.attachments_from_rows(rows) == {"S5_PROTEABRACKET": 61}
+    assert all("ROOF DESCRIPTION" not in d for _, _, d in rows)
+
+
+def test_moyes_disconnects_from_table():
+    rows, _ = tt.equipment_rows(_FX_MOYES)
+    ac, dc = tt.disconnects_from_rows(rows)
+    assert [(d["amp"], d["fused"]) for d in ac] == [(60, True)] and [d["poles"] for d in dc] == [4]
+
+
+def test_moyes_roof_planes_both_metal():
+    planes = tt.roof_planes_by_type(_FX_MOYES, 0)
+    assert sorted((p["roof_type"], p["modules"]) for p in planes) == [("metal", 10), ("metal", 13)]

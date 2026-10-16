@@ -61,37 +61,54 @@ def _rows_from_tables(page) -> list[tuple[str, int, str]]:
     return out
 
 
+_TABLE_END = ("ROOF DESCRIPTION", "ARRAY AREA", "NOTE:", "NOTES:", "LEGEND", "SCALE", "(N) ", "ROOF ACCESS",
+              "SHEET NAME", "FIRE SETBACK", "ROOF #", "STRING #")
+
+
 def _rows_from_lines(text: str) -> list[tuple[str, int, str]]:
     """Fallback for unruled tables in EQUIPMENT / QTY / DESCRIPTION reading order: label line(s), then an
-    integer-only QTY line, then description line(s) up to the next label. Only used between an
-    'EQUIPMENT' header and the end of the text."""
+    integer-only QTY line, then description line(s) up to the next label. The block is BOUNDED: it ends
+    at the first line that starts another drawing element (ROOF DESCRIPTION, ARRAY AREA, NOTE, (N) ...
+    call-outs). Without that bound the parser ran into the ROOF DESCRIPTION table and read a plane's
+    module count as a quantity (user, Moyes #971010: ProteaBracket 61 + 13 -> 74)."""
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     try:
         i0 = next(i for i, l in enumerate(lines) if l.upper() == "EQUIPMENT")
     except StopIteration:
         return []
-    lines = [l for l in lines[i0 + 1:] if l.upper() not in ("QTY", "QUANTITY", "DESCRIPTION")]
+    body = []
+    for l in lines[i0 + 1:]:
+        U = l.upper()
+        if U in ("QTY", "QUANTITY", "DESCRIPTION"):
+            continue
+        if any(U.startswith(t) for t in _TABLE_END):
+            break
+        body.append(l)
+    lines = body
     qidx = [i for i, l in enumerate(lines) if _INT.match(l)]
     out = []
     prev_end = 0
     for k, qi in enumerate(qidx):
-        # label = lines between previous description end and qty; description = next 1-3 lines
         nxt = qidx[k + 1] if k + 1 < len(qidx) else len(lines)
-        label_lines = lines[prev_end:qi]
-        if k > 0 and label_lines:
-            # previous description already consumed up to its own boundary; keep the last 1-3 lines
-            label_lines = label_lines[-3:]
+        label_lines = lines[prev_end:qi][-3:]
         desc_lines = lines[qi + 1: nxt]
-        # split desc vs next label: the next label is the trailing lines that look like an EQUIPMENT label
         cut = len(desc_lines)
         if k + 1 < len(qidx):
+            # the next row's label = trailing short all-caps lines (case-insensitive: "MCI's")
             for j in range(len(desc_lines) - 1, 0, -1):
-                if desc_lines[j].isupper() and len(desc_lines[j]) <= 22:
-                    cut = j
-                else:
-                    break
+                d = desc_lines[j]
+                if d.upper() == d.upper().strip() and d == d.upper() or (len(d) <= 22 and not
+                                                                         re.search(r"\d", d)):
+                    if len(d) <= 30:
+                        cut = j
+                        continue
+                break
+        desc_lines = desc_lines[:cut][:3]                  # a description never spans > 3 lines
+        if not label_lines:
+            prev_end = qi + 1 + cut
+            continue                                       # no EQUIPMENT label -> not a table row
         out.append((_clean(" ".join(label_lines)), int(_INT.match(lines[qi]).group(1)),
-                    _clean(" ".join(desc_lines[:cut]))))
+                    _clean(" ".join(desc_lines))))
         prev_end = qi + 1 + cut
     return out
 
@@ -204,7 +221,10 @@ def attachments_from_rows(rows) -> dict[str, int]:
     on the shingle structure + S-5! ProteaBracket on the metal structure). Returns {attachment_type: qty}."""
     out: dict[str, int] = {}
     for equip, qty, desc in rows:
-        b = _clean(equip) + " " + _clean(desc)
+        E = _clean(equip)
+        if not E or not ("ATTACHMENT" in E or "PROTEA" in E or "SOLARFOOT" in E or "MULTIMOUNT" in E):
+            continue                                   # only real ATTACHMENT table rows
+        b = E + " " + _clean(desc)
         if "L FOOT" in b and "PROTEA" not in b and "SOLARFOOT" not in b and "SOLAR FOOT" not in b:
             continue
         if "SOLARFOOT" in b or "SOLAR FOOT" in b:
