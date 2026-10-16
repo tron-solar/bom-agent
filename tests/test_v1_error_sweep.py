@@ -254,3 +254,19 @@ def test_table_wins_over_short_callouts():
     r, f, _ = _orch._racking_block(pl)
     assert r[33] == 40 and r[37] == 100 and r[46] == 140
     assert any(x["item"] == "racking_attachment_callout_crosscheck" for x in f)
+
+
+def test_oneline_overrules_table_for_ac_and_dc_wyer():
+    rows, _ = tt.equipment_rows(os.path.join(_D, "fixtures_wyer_915365_pv3.pdf"))
+    tab_ac, tab_dc = tt.disconnects_from_rows(rows)
+    co_ac, co_dc = tt.disconnects_from_callouts(_txt("fixtures_wyer_915365_pv5.pdf"))
+    ac, dc = tt.select_disconnects(tab_ac, tab_dc, co_ac, co_dc)
+    assert ac is co_ac and [d["poles"] for d in dc] == [4, 4]          # one-line wins (table had 4,2,2)
+
+
+def test_table_fallback_when_oneline_silent():
+    tab_ac = [{"amp": 60, "fused": False}]
+    tab_dc = [{"poles": 2}]
+    assert tt.select_disconnects(tab_ac, tab_dc, [], []) == (tab_ac, tab_dc)
+    co_ac = [{"amp": 30, "fused": True}]
+    assert tt.select_disconnects(tab_ac, tab_dc, co_ac, [])[0] is co_ac

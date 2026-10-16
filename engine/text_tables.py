@@ -343,3 +343,10 @@ def attachments_from_callouts(text: str) -> dict[str, int]:
         for k, v in attachments_from_rows(rows).items():
             out[k] = out.get(k, 0) + v
     return out
+
+
+def select_disconnects(tab_ac, tab_dc, co_ac, co_dc):
+    """Source priority (user, 2026-10-16): the PV-5 ONE-LINE call-outs win for BOTH AC (qty + rating +
+    fused) and DC disconnects; the PV-3 BOM table is the fallback when the one-line names none of that
+    kind. Returns (ac, dc)."""
+    return (co_ac or tab_ac), (co_dc or tab_dc)

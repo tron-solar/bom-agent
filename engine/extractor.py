@@ -1340,14 +1340,17 @@ class PlansetExtractor:
         electrical_data["equipment_rows"] = eq_rows
         tab_ac, tab_dc = _tt.disconnects_from_rows(eq_rows)
         co_ac, co_dc = _tt.disconnects_from_callouts(self._page_text(pdf_path, pv5_page))
-        ac_final = tab_ac or co_ac
+        # AC disconnects (qty + rating + fused): the PV-5 ONE-LINE call-outs take priority; the PV-3 BOM
+        # table is the fallback when the one-line names none (user, 2026-10-16).
+        ac_final, _ = _tt.select_disconnects(tab_ac, tab_dc, co_ac, co_dc)
         # DC disconnects: the PV-5 ONE-LINE call-outs OVERRULE the BOM table (user, Wyer #915365);
         # the table is used only when the one-line names none.
-        dc_final = co_dc or tab_dc
-        # a fused table row without a fuse size: take the fuse size from a matching one-line call-out
+        _, dc_final = _tt.select_disconnects(tab_ac, tab_dc, co_ac, co_dc)
+        # a fused disconnect without a fuse size: borrow it from the other text source's matching entry
+        other = tab_ac if ac_final is co_ac else co_ac
         for d in ac_final:
             if d.get("fused") and not d.get("fuse_amp"):
-                m = next((c for c in co_ac if c.get("fused") and c.get("amp") == d["amp"]
+                m = next((c for c in other if c.get("fused") and c.get("amp") == d["amp"]
                           and c.get("fuse_amp")), None)
                 if m:
                     d["fuse_amp"] = m["fuse_amp"]
@@ -1363,11 +1366,11 @@ class PlansetExtractor:
                        f"DC); PV-3 BOM table listed {_sig_dc(tab_dc)}-pole."})
         if tab_ac and co_ac and _sig_ac(tab_ac) != _sig_ac(co_ac):
             disc_flags.append({
-                "level": "HARD", "item": "ac_disconnect_table_vs_oneline",
-                "msg": f"AC disconnects disagree: PV-3 BOM table {_sig_ac(tab_ac)} vs PV-5 one-line "
-                       f"call-outs {_sig_ac(co_ac)}. Delivered the table; confirm which is current."})
-        for kind, fin, vis, src in (("ac", ac_final, vis_ac, "table" if tab_ac else "callout"),
-                                    ("dc", dc_final, vis_dc, "table" if tab_dc else "callout")):
+                "level": "NOTE", "item": "ac_disconnect_table_vs_oneline",
+                "msg": f"AC disconnects: PV-5 one-line {_sig_ac(co_ac)} (amp, fused) delivered (one-line "
+                       f"overrules AC); PV-3 BOM table listed {_sig_ac(tab_ac)}."})
+        for kind, fin, vis, src in (("ac", ac_final, vis_ac, "one-line" if co_ac else "table"),
+                                    ("dc", dc_final, vis_dc, "one-line" if co_dc else "table")):
             if len(fin) != len(vis):
                 disc_flags.append({
                     "level": "NOTE", "item": f"{kind}_disconnect_text_vs_vision",
