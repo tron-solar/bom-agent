@@ -118,8 +118,13 @@ async def work_order_webhook(token: str, request: Request, background: Backgroun
     if not project_id:
         raise HTTPException(status_code=400, detail="no project_id in work-order webhook")
 
-    # SAME pipeline + task_key + idempotency marker as the manual endpoint (duplicate deliveries skip).
-    task_key = CONFIG.create_bom_task_key
+    # Idempotency is per WORK ORDER, not per project (user, 2026-10-16): opening a NEW "Create BOM" work
+    # order on a project that already has a BOM must produce a fresh BOM with the current engine; only a
+    # duplicate delivery of the SAME work order is skipped. Falls back to the project-level key if the
+    # payload carries no work-order id.
+    wo_id = wo.get("id") or ev.get("workOrderId")
+    task_key = (f"{CONFIG.create_bom_task_key}_wo_{wo_id}" if wo_id is not None
+                else CONFIG.create_bom_task_key)
     background.add_task(_run, str(project_id), task_key)
     return JSONResponse({"status": "accepted", "project_id": str(project_id), "task_key": task_key},
                         status_code=202)

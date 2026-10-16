@@ -146,10 +146,10 @@ def _wire_wo(monkeypatch):
     return fake
 
 
-def _wo_payload(title, record_id, rtype="PROJECT"):
-    return {"workOrder": {"id": 5001, "title": title, "recordId": record_id, "status": "OPEN"},
+def _wo_payload(title, record_id, rtype="PROJECT", wo_id=5001):
+    return {"workOrder": {"id": wo_id, "title": title, "recordId": record_id, "status": "OPEN"},
             "record": {"id": record_id, "title": "Joseph Woroszylo", "type": rtype},
-            "event": {"workOrderId": 5001, "recordId": record_id, "triggerKey": "TASK_CREATED",
+            "event": {"workOrderId": wo_id, "recordId": record_id, "triggerKey": "TASK_CREATED",
                       "triggerName": "Work Order created"}}
 
 
@@ -202,8 +202,20 @@ def test_work_order_webhook_duplicate_delivery_idempotent(monkeypatch):
     p = _wo_payload("Create BOM", 611005)
     c.post(f"/webhooks/coperniq/work-order/{_WO_TOKEN}", json=p)            # 1st: fires -> 2 files
     c.post(f"/webhooks/coperniq/work-order/{_WO_TOKEN}", json=p)            # 2nd: idempotency-skipped
-    assert pipeline.already_processed("611005", "create_bom")
+    assert pipeline.already_processed("611005", "create_bom_wo_5001")
     assert len(fake.files) == 2                                            # no double-post
+
+
+def test_new_create_bom_work_order_reruns_same_project(monkeypatch):
+    # user, 2026-10-16: a NEW "Create BOM" work order on a project that already has a BOM must re-run
+    # (fresh BOM with current engine fixes); the SAME work order re-delivered still skips.
+    fake = _wire_wo(monkeypatch)
+    c = TestClient(main.app)
+    c.post(f"/webhooks/coperniq/work-order/{_WO_TOKEN}", json=_wo_payload("Create BOM", 611006, wo_id=7001))
+    c.post(f"/webhooks/coperniq/work-order/{_WO_TOKEN}", json=_wo_payload("Create BOM", 611006, wo_id=7001))
+    assert len(fake.files) == 2                                            # retry of WO 7001 skipped
+    c.post(f"/webhooks/coperniq/work-order/{_WO_TOKEN}", json=_wo_payload("Create BOM", 611006, wo_id=7002))
+    assert len(fake.files) == 4                                            # new WO 7002 -> new BOM
 
 
 def test_served_file_roundtrip(monkeypatch):
