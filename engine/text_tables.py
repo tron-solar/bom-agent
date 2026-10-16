@@ -300,3 +300,16 @@ def roof_planes_by_type(pdf_path: str, page_index: int | None) -> list[dict]:
     finally:
         doc.close()
     return out
+
+
+def attachments_from_callouts(text: str) -> dict[str, int]:
+    """Roof-plan call-outs '(112) S-5! PROTEA BRACKET ATTACHMENTS' / '(32) K2 MULTIMOUNT ATTACHMENTS
+    (DECK MOUNTED)' — the source when there is no BOM table. Call-outs can wrap, so the text is
+    flattened first. Returns {attachment_type: qty} summed over call-outs."""
+    flat = " ".join(str(text or "").upper().split())
+    out: dict[str, int] = {}
+    for m in re.finditer(r"\((\d{1,4})\)\s*([^()]{0,60}?ATTACHMENTS?)", flat):
+        rows = [("ATTACHMENT", int(m.group(1)), m.group(2))]
+        for k, v in attachments_from_rows(rows).items():
+            out[k] = out.get(k, 0) + v
+    return out

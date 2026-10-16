@@ -1285,6 +1285,12 @@ class PlansetExtractor:
         # supply-side-tap substring match (orchestrator rows 26-28) and the harness one_line source.
         electrical_data["one_line_text"] = (self._page_text(pdf_path, pv5_page)
                                             if pv5_page is not None else "")
+        # TESLA BACKUP SWITCH from TEXT (user, Harris #903765): most plans have no BOM table; the
+        # one-line labels it "(N) TESLA BACKUP SWITCH" (often wrapped over two lines). Text wins; the
+        # Vision boolean can only add, never remove, when the text is silent.
+        _ol_flat = " ".join(electrical_data["one_line_text"].upper().split())
+        if "TESLA BACKUP SWITCH" in _ol_flat or "BACKUP SWITCH" in _ol_flat or "1624171" in _ol_flat:
+            electrical_data["backup_switch"] = True
 
         # --- Step 2.5: Read bus-kit breakers + CSR from the PV-5 TEXT LAYER (exact vector text +
         # coordinates) — deterministic, replaces the low-res Vision image read for these fields. The
@@ -1357,6 +1363,7 @@ class PlansetExtractor:
 
         # --- Step 3: Extract roof plan (PV-3) — same HARD-fail policy ---
         pv3_page = self._find_page_by_label(pdf_path, "PV-3")
+        electrical_data["pv3_text"] = self._page_text(pdf_path, pv3_page) if pv3_page is not None else ""
         if pv3_page is None:
             warnings.append("page selection failed: PV-3 — could not confidently identify the "
                             "roof-plan sheet; PV-3 array data NOT extracted (no fallback page).")

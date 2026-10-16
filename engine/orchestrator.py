@@ -183,13 +183,45 @@ def _build_blocks(planset, project: dict):
     # with PW3 present needs one 60A/2P (BR260, Electrical row 106) per PW3 to land on — same row/SKU
     # as the bus-kit 60A/2P, coupled to the PW3 count, de-duped against the gateway bus-kit's BR260.
     pw3_landing_count = len(pw3_skus) or battery_count
-    _landing = _pw3_landing_breaker_qty(elec.get("ac_disconnects") or [], pw3_landing_count,
-                                        elec_rows.get(106, 0))
-    if _landing is not None:
-        elec_rows[106] = _landing
-        flags.append({"level": "NOTE", "item": "pw3_landing_breaker",
-                      "msg": f"Non-fused AC disconnect with {pw3_landing_count} PW3 unit(s): {_landing}x "
-                             f"BR260 (60A/2P, Electrical row 106) added for the PW3 to land on."})
+    _ol = elec.get("one_line_text") or ""
+    _mn = elec.get("master_note_text") or ""
+    _line_side = ee.line_side_interconnection(_ol, _mn)
+    _mfr = ee.poi_panel_mfr(_mn, _ol, elec.get("msp_pn"), elec.get("meter_pn"))
+    if gateway_count:
+        # Gateway jobs: PW3 lands in the gateway bus-kit (Eaton BR260, row 106) — unchanged.
+        _landing = _pw3_landing_breaker_qty(elec.get("ac_disconnects") or [], pw3_landing_count,
+                                            elec_rows.get(106, 0))
+        if _landing is not None:
+            elec_rows[106] = _landing
+            flags.append({"level": "NOTE", "item": "pw3_landing_breaker",
+                          "msg": f"Non-fused AC disconnect with {pw3_landing_count} PW3 unit(s): {_landing}x "
+                                 f"BR260 (60A/2P, Electrical row 106) added for the PW3 to land on."})
+    elif pw3_landing_count > 0 and not _line_side and (
+            backup_switch or _pw3_landing_breaker_qty(elec.get("ac_disconnects") or [],
+                                                       pw3_landing_count, 0) is not None):
+        # LOAD-SIDE Backup Switch / non-gateway PW3 (user, 2026-10-16): one 60A/2P per PW3, SKU by the
+        # manufacturer of the panel it lands in — Eaton/Milbank meter-main -> row 106, Homeline -> 124,
+        # unknown -> highlighted row 115.
+        _run_block("pw3_landing_breaker", flags, elec_rows,
+                   lambda: ee.poi_breaker(60, _mfr, pw3_landing_count, "PW3 load-side landing breaker"),
+                   elec_special)
+    elif pw3_landing_count == 0 and not gateway_count and int(planset.module_quantity or 0) > 0 \
+            and not _line_side:
+        # PV-ONLY POI breaker (user, Trumbo #972103 / C. Murphy #894545): rated breaker from text, else
+        # 40A/2P; Eaton/Milbank -> row 104, Homeline -> 122, unknown -> highlighted row 115.
+        _amp = ee.pv_poi_amp_from_text(_ol, _mn) or 40
+        _run_block("pv_poi_breaker", flags, elec_rows,
+                   lambda: ee.poi_breaker(_amp, _mfr, 1, "PV-only POI breaker"), elec_special)
+
+    # GROUND BAR for N&G separation when a NEW METER/MAIN is installed (user, Gordon #973198): row 22,
+    # in addition to the per-gateway ground bar.
+    if ee.new_meter_main(elec.get("meter_pn"), _ol):
+        _run_block("ground_bar_meter_main", flags, elec_rows,
+                   lambda: ({22: 1}, [{"level": "NOTE", "item": "ground_bar_meter_main",
+                                       "detail": "New meter/main: +1 ground bar (row 22) for N&G separation."}]))
+
+    # NEW 100A BACKED-UP LOADS PANEL -> row 74 (user, Calhoon #848183)
+    _run_block("backed_up_loads_panel", flags, elec_rows, lambda: ee.backed_up_loads_panel(_ol, _mn))
 
     # Tesla PW3 Expansion (rows 59 unit / 63-65 harness by -05/-20/-40 / 61 stack or 62 wall kit).
     # Mount was already resolved in the extractor (plan -> Master Note -> default wall).
@@ -429,6 +461,10 @@ def _racking_block(planset):
     from . import text_tables as _tt
     _eq_rows = ((getattr(planset, "electrical", None) or {}).get("equipment_rows")) or []
     by_type = {k: v for k, v in _tt.attachments_from_rows(_eq_rows).items() if k != "UNKNOWN"}
+    if not by_type:
+        # no BOM table (most plans going forward): roof-plan call-outs on PV-3
+        by_type = {k: v for k, v in _tt.attachments_from_callouts(
+            (getattr(planset, "electrical", None) or {}).get("pv3_text") or "").items() if k != "UNKNOWN"}
     if by_type and at not in ("K2_GROUND",) and system != "ground":
         at = at if at in by_type else next(iter(by_type))
     if at in ("K2_SHINGLE", "S5_PROTEABRACKET", "S5_SOLARFOOT"):

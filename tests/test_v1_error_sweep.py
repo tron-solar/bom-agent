@@ -96,3 +96,56 @@ def test_msp_master_note_wins_and_either_source_adds():
     assert main_service_panel_resolved(False, None, "Existing MSP can remain")[0] == {}
     rows, flags, _ = main_service_panel_resolved(True, "HOM3060M200PC", "New MSP HOM4080M200PC")
     assert rows == {77: 1} and any(f["item"] == "msp_note_vs_plan" for f in flags)
+
+
+# ---- round 3: POI/landing breaker by panel mfr, ground bar, loads panel, default MSP, backup switch ----
+from types import SimpleNamespace as _NS
+import engine.orchestrator as _orch
+import engine.electrical_engine as _ee
+
+
+def _build(elec, mods=30, bat=0):
+    p = _NS(module_model="ELNSM54M-HC-N-450", module_quantity=mods, battery_quantity=bat, electrical=elec,
+            racking={}, jboxes={"roof_type": "shingle", "modules_per_plane": [mods]}, arrays=[])
+    _, er, _, es, _ = _orch._build_blocks(p, {})
+    return er, es
+
+
+def test_backup_switch_milbank_meter_main_lands_on_eaton_106_plus_ground_bar():
+    er, _ = _build({"pw3_skus": ["1707000"], "pw3_count": 1, "backup_switch": True, "gateway_count": 0,
+                    "meter_pn": "U6281-XL-200-5T6-AMS", "new_meter_drawn": True, "master_note_text": "",
+                    "one_line_text": "(N) UTILITY METER/MAIN COMBO MILBANK U6281-XL-200-5T6-AMS",
+                    "ac_disconnects": [{"amp": 60, "fused": False}]}, bat=1)
+    assert er.get(106) == 1 and er.get(22) == 1 and 124 not in er
+
+
+def test_homeline_landing_row_124():
+    er, _ = _build({"pw3_skus": ["1707000"], "pw3_count": 1, "backup_switch": True, "gateway_count": 0,
+                    "master_note_text": "POI: 60A breaker in Homeline MSP", "one_line_text": "",
+                    "ac_disconnects": []}, bat=1)
+    assert er.get(124) == 1 and 106 not in er
+
+
+def test_pv_only_poi_40a_homeline_and_no_rsd():
+    er, _ = _build({"pw3_count": 0, "gateway_count": 0, "master_note_text": "",
+                    "one_line_text": "(E) 200A SQUARE D HOMELINE MSP\n(N) 40A/2P PV BREAKER", "ac_disconnects": []})
+    assert er.get(122) == 1 and 19 not in er and 106 not in er
+
+
+def test_pv_only_unknown_panel_highlighted_row_115():
+    er, es = _build({"pw3_count": 0, "gateway_count": 0, "one_line_text": "", "master_note_text": "",
+                     "ac_disconnects": []})
+    assert er.get(115) == 1 and "FIND EXACT SKU" in es[115][0]
+
+
+def test_backed_up_loads_panel_100a_row_74():
+    assert _ee.backed_up_loads_panel("(N) 100A BACKED UP LOADS PANEL")[0] == {74: 1}
+
+
+def test_mpu_without_sku_defaults_row_76():
+    assert _ee.main_service_panel_resolved(False, None, "MPU: upgrade to new 200A MSP")[0] == {76: 1}
+
+
+def test_attachment_callouts_without_bom_table():
+    assert tt.attachments_from_callouts("(112) S-5! PROTEA BRACKET\nATTACHMENTS\n(32) K2 MULTIMOUNT "
+                                        "ATTACHMENTS (DECK MOUNTED)") == {"S5_PROTEABRACKET": 112, "K2_SHINGLE": 32}

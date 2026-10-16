@@ -49,6 +49,12 @@ def _stamp_special_orders(ws, special_order):
             b_text = c_text = text
         ws.cell(int(row), SKU_COL).value = str(b_text)
         ws.cell(int(row), DESC_COL).value = str(c_text)
+        if "FIND EXACT SKU" in str(b_text).upper():
+            # flagged placeholder line (e.g. POI breaker, unknown panel mfr -> row 115): highlight A:D
+            from openpyxl.styles import PatternFill
+            fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+            for c in range(1, 5):
+                ws.cell(int(row), c).fill = fill
 
 
 def write_bom(template_path, out_path, *, customer_name, warehouse_zone, customer_address,

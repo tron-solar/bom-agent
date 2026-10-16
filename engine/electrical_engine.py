@@ -584,7 +584,7 @@ def main_service_panel(new_msp_drawn, msp_pn=None):
 # (never a HARD hold, never an override). This is the inverse of the mount-resolution precedence:
 # mount is not drawn as a discrete value on most plans, so the note legitimately fills it; but any
 # value the plan DOES state (harness P/N, breakers, meter SKU, module/battery counts) wins.
-_MSP_LINE = re.compile(r"\b(MSP|MAIN SERVICE PANEL|MAIN PANEL|LOAD CENTER|LOADCENTER|MAIN BREAKER PANEL)\b")
+_MSP_LINE = re.compile(r"\b(MSP|MAIN SERVICE PANEL|MAIN PANEL|LOAD CENTER|LOADCENTER|MAIN BREAKER PANEL|MPU)\b")
 _MODEL = re.compile(r"\b([A-Z]{2,5}\d{2,}[A-Z0-9]*(?:-[A-Z0-9]+)*)\b")
 
 
@@ -627,9 +627,140 @@ def main_service_panel_resolved(plan_new, plan_pn, note_text, plan_text=""):
         flags.append({"level": "NOTE", "item": "msp_note_vs_plan",
                       "detail": f"MSP SKU: Master Note {note_pn!r} vs plan {plan_pn!r} — Master Note wins."})
     pn = note_pn or plan_pn
-    new = bool(note_pn) or bool(plan_new) or bool(text_pn)
+    new_txt, amp_txt = msp_new_from_text(note_text)
+    new_pl, amp_pl = msp_new_from_text(plan_text)
+    new = bool(note_pn) or bool(plan_new) or bool(text_pn) or new_txt or new_pl
+    if new and not pn:
+        # NEW MSP / MPU called out with no model number (user, Starr #865577): default Homeline 200A
+        # row 76 (HOM3060M200PC); a stated 100A -> row 74.
+        amp = amp_txt or amp_pl or 200
+        row = 74 if amp == 100 else 76
+        return {row: 1}, flags + [{"level": "NOTE", "item": "msp_default",
+                                   "detail": f"New MSP/MPU called out without a SKU ({amp}A) -> default row {row}."}], {}
     rows, f2, so = main_service_panel(new, pn)
     return rows, flags + f2, so
+
+
+def msp_new_from_text(text):
+    """(is_new, amps) for a NEW MSP / main panel upgrade stated in text without a model number."""
+    for raw in str(text or "").upper().splitlines():
+        L = " ".join(raw.split())
+        if not (_MSP_LINE.search(L) or "MPU" in L or "MAIN PANEL UPGRADE" in L or "PANEL UPGRADE" in L):
+            continue
+        if "REMAIN" in L or "BACK" in L and "UP LOAD" in L:
+            continue
+        if any(w in L for w in ("NEW", "UPGRADE", "REPLACE", "INSTALL", "(N)", "MPU")) and \
+                not ("EXISTING" in L and not any(w in L for w in ("UPGRADE", "REPLACE", "MPU"))):
+            m = re.search(r"\b(100|125|150|200|225)\s*A\b", L)
+            return True, (int(m.group(1)) if m else None)
+    return False, None
+
+
+# ---------- POI / landing breaker by PANEL MANUFACTURER (user, 2026-10-16) ----------
+# The interconnection (POI) breaker's SKU depends on the panel it lands in:
+#   Eaton panel           -> BR2xx  (rows 101-110)
+#   Homeline / Square D   -> HOM2xx (rows 119-128)
+#   Milbank meter/main    -> Eaton BR2xx (Milbank meter-mains take BR breakers)
+#   unknown manufacturer  -> row 115 (blank template row), HIGHLIGHTED: find the exact SKU.
+_BR2_ROW = {15: 101, 20: 102, 30: 103, 40: 104, 50: 105, 60: 106, 70: 107, 80: 108, 100: 109, 125: 110}
+_HOM2_ROW = {15: 119, 20: 120, 30: 121, 40: 122, 50: 123, 60: 124, 70: 125, 80: 126, 100: 127, 125: 128}
+POI_UNKNOWN_ROW = 115
+
+
+def _mfr_in(t: str):
+    t = (t or "").upper()
+    if "MILBANK" in t and ("METER/MAIN" in t or "METER MAIN" in t or "U6281" in t or "U5168" in t):
+        return "eaton"
+    if "HOMELINE" in t or "SQUARE D" in t or "SQ-D" in t or "SQ D" in t or re.search(r"\bHOM\d", t):
+        return "homeline"
+    if "EATON" in t or "CUTLER" in t or re.search(r"\bBR\d{3}", t) or re.search(r"\bBR\d{2}\d*B\d", t):
+        return "eaton"
+    return None
+
+
+def poi_panel_mfr(note_text="", one_line_text="", msp_pn=None, meter_pn=None):
+    """Manufacturer of the panel the POI breaker lands in. Precedence: Master Note POI/breaker lines
+    (the note may name the breaker type outright) -> the NEW MSP SKU -> a NEW Milbank meter/main ->
+    one-line text lines that name the MSP/panel. Returns 'eaton' | 'homeline' | None."""
+    for raw in str(note_text or "").upper().splitlines():
+        if any(k in raw for k in ("POI", "BREAKER", "BACKFEED", "INTERCONNECT", "LAND")):
+            m = _mfr_in(raw)
+            if m:
+                return m
+    if msp_pn:
+        m = _mfr_in(str(msp_pn))
+        if m:
+            return m
+    if meter_pn and str(meter_pn).upper().startswith(("U6281", "U5168")):
+        return "eaton"
+    for raw in str(one_line_text or "").upper().splitlines():
+        if any(k in raw for k in ("MSP", "MAIN SERVICE PANEL", "PANEL", "LOAD CENTER", "METER/MAIN",
+                                  "METER MAIN")):
+            m = _mfr_in(raw)
+            if m:
+                return m
+    return None
+
+
+def poi_breaker(amp, mfr, qty=1, label="POI breaker"):
+    """({row: qty}, flags, special) for a 2-pole POI/landing breaker of `amp` in a `mfr` panel."""
+    table = _BR2_ROW if mfr == "eaton" else _HOM2_ROW if mfr == "homeline" else None
+    row = table.get(int(amp)) if table else None
+    if row:
+        return {row: qty}, [{"level": "NOTE", "item": "poi_breaker",
+                             "detail": f"{label}: {qty}x {amp}A/2P in a {mfr} panel -> row {row}."}], {}
+    txt = f"{amp}A 2P BREAKER — FIND EXACT SKU (panel manufacturer not identified)"
+    return ({POI_UNKNOWN_ROW: qty},
+            [{"level": "HARD", "item": "poi_breaker_mfr_unknown",
+              "detail": f"{label}: {amp}A/2P but the panel manufacturer (Eaton/Homeline/Milbank) wasn't "
+                        f"found on the plans or Master Note. Placed on HIGHLIGHTED row {POI_UNKNOWN_ROW}; "
+                        f"find the exact SKU."}],
+            {POI_UNKNOWN_ROW: (txt, txt)})
+
+
+_POI_AMP = re.compile(r"\b(\d{2,3})\s*A\s*(?:/|-)?\s*2\s*P\b")
+
+
+def pv_poi_amp_from_text(one_line_text="", note_text=""):
+    """Rated PV interconnection breaker from text ('(N) 40A/2P PV BREAKER', 'POI: 40A 2P backfeed').
+    Returns int amps or None."""
+    for src in (note_text, one_line_text):
+        for raw in str(src or "").upper().splitlines():
+            if "(E)" in raw or "EXISTING" in raw or "MAIN BREAKER" in raw:
+                continue
+            if any(k in raw for k in ("POI", "PV", "SOLAR", "BACKFEED", "INTERCONNECT", "BACK-FEED")):
+                m = _POI_AMP.search(raw)
+                if m and int(m.group(1)) <= 125:
+                    return int(m.group(1))
+    return None
+
+
+def line_side_interconnection(one_line_text="", note_text=""):
+    t = (str(one_line_text) + " " + str(note_text)).upper()
+    return any(k in t for k in ("K4977", "LINE SIDE TAP", "LINE-SIDE TAP", "SUPPLY SIDE", "SUPPLY-SIDE"))
+
+
+def backed_up_loads_panel(one_line_text="", note_text=""):
+    """NEW backed-up loads panel (user, Calhoon #848183): 100A -> row 74 (HOM2040M100PC)."""
+    t = " ".join((str(one_line_text) + "\n" + str(note_text)).upper().split())
+    m = re.search(r"((?:\(N\)|NEW)[^.\n]{0,40}?)?(\d{3})\s*A[^.]{0,40}?BACK(?:ED)?[ -]?UP LOADS? (?:PANEL|CENTER)", t) \
+        or re.search(r"BACK(?:ED)?[ -]?UP LOADS? (?:PANEL|CENTER)[^.]{0,40}?(\d{3})\s*A", t)
+    if not m:
+        return {}, []
+    amp = int([g for g in m.groups() if g and g.isdigit()][-1])
+    if amp == 100:
+        return {74: 1}, [{"level": "NOTE", "item": "backed_up_loads_panel",
+                          "detail": "New 100A backed-up loads panel -> row 74 (HOM2040M100PC)."}]
+    return {}, [{"level": "HARD", "item": "backed_up_loads_panel_unmapped",
+                 "detail": f"New {amp}A backed-up loads panel called out; only 100A (row 74) is mapped. Add it."}]
+
+
+def new_meter_main(meter_pn=None, one_line_text=""):
+    pn = str(meter_pn or "").upper()
+    if pn.startswith(("U6281", "U5168")):
+        return True
+    t = str(one_line_text or "").upper()
+    return "(N)" in t and ("METER/MAIN" in t or "METER MAIN" in t)
 
 
 def plan_vs_note(item, plan_value, note_value):
