@@ -170,3 +170,37 @@ def test_moyes_disconnects_from_table():
 def test_moyes_roof_planes_both_metal():
     planes = tt.roof_planes_by_type(_FX_MOYES, 0)
     assert sorted((p["roof_type"], p["modules"]) for p in planes) == [("metal", 10), ("metal", 13)]
+
+
+# ---- Wyer #915365 (real PV-3 / PV-5) ----
+import fitz as _fitz
+_D = os.path.dirname(__file__)
+
+
+def _txt(name):
+    return _fitz.open(os.path.join(_D, name))[0].get_text()
+
+
+def test_wyer_msp_note_new_egc_is_not_a_new_msp():
+    note = "POI: TEG with 200A CSR breaker\nMETER: Upgrade to U9551 in existing location\nMSP: Separate N & G, new 4 AWG EGC"
+    assert _ee.msp_new_from_text(note) == (False, None)
+    assert _ee.main_service_panel_resolved(False, None, note, _txt("fixtures_wyer_915365_pv5.pdf"))[0] == {}
+
+
+def test_wyer_mixed_roof_from_real_pv3():
+    p = os.path.join(_D, "fixtures_wyer_915365_pv3.pdf")
+    rows, _ = tt.equipment_rows(p)
+    assert tt.attachments_from_rows(rows) == {"K2_SHINGLE": 32, "S5_PROTEABRACKET": 112}
+    planes = sorted((x["roof_type"], x["modules"]) for x in tt.roof_planes_by_type(p, 0))
+    assert planes == [("metal", 15), ("metal", 15), ("shingle", 12)]
+
+
+def test_wyer_oneline_callouts_wrapped_text():
+    ac, dc = tt.disconnects_from_callouts(_txt("fixtures_wyer_915365_pv5.pdf"))
+    assert [(d["amp"], d["fused"]) for d in ac] == [(60, False), (60, False)]
+    assert [d["poles"] for d in dc] == [4, 4]
+
+
+def test_moyes_oneline_fused_disconnect():
+    ac, dc = tt.disconnects_from_callouts(_txt("fixtures_moyes_971010_pv5.pdf"))
+    assert [(d["amp"], d["fused"]) for d in ac] == [(60, True)] and [d["poles"] for d in dc] == [4]

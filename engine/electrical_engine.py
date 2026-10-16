@@ -641,16 +641,23 @@ def main_service_panel_resolved(plan_new, plan_pn, note_text, plan_text=""):
     return rows, flags + f2, so
 
 
+_PANEL = r"(?:MSP|MAIN SERVICE PANEL|MAIN PANEL|MAIN BREAKER PANEL|SERVICE PANEL|LOAD ?CENTER|PANEL)"
+_NEW_MSP = re.compile(
+    r"\b(?:\(N\)|NEW|UPGRADE(?:D)?(?:\s+TO)?|REPLACE(?:D)?(?:\s+WITH)?|INSTALL(?:ED)?)\b"
+    r"(?:\s+(?!EGC|GROUND|GEC|BONDING|BREAKER|METER|WIRE|CONDUCTOR)[\w/.-]+){0,4}?\s+" + _PANEL + r"\b")
+_MPU = re.compile(r"\b(?:MPU|MAIN PANEL UPGRADE|MSP UPGRADE|PANEL UPGRADE|UPGRADE (?:THE )?MSP)\b")
+
+
 def msp_new_from_text(text):
-    """(is_new, amps) for a NEW MSP / main panel upgrade stated in text without a model number."""
+    """(is_new, amps) for a NEW MSP / main panel upgrade stated in text without a model number.
+    The NEW/UPGRADE word must apply to the PANEL itself ('upgrade to new 200A MSP', 'MPU', '(N) MAIN
+    SERVICE PANEL'). A line that merely mentions the MSP and something else new does NOT count
+    (user, Wyer #915365: 'MSP: Separate N & G, new 4 AWG EGC' was read as a new MSP -> row 76)."""
     for raw in str(text or "").upper().splitlines():
         L = " ".join(raw.split())
-        if not (_MSP_LINE.search(L) or "MPU" in L or "MAIN PANEL UPGRADE" in L or "PANEL UPGRADE" in L):
+        if "REMAIN" in L or "(E)" in L or ("BACK" in L and "UP LOAD" in L):
             continue
-        if "REMAIN" in L or "BACK" in L and "UP LOAD" in L:
-            continue
-        if any(w in L for w in ("NEW", "UPGRADE", "REPLACE", "INSTALL", "(N)", "MPU")) and \
-                not ("EXISTING" in L and not any(w in L for w in ("UPGRADE", "REPLACE", "MPU"))):
+        if _MPU.search(L) or _NEW_MSP.search(L):
             m = re.search(r"\b(100|125|150|200|225)\s*A\b", L)
             return True, (int(m.group(1)) if m else None)
     return False, None

@@ -1350,6 +1350,16 @@ class PlansetExtractor:
                 if m:
                     d["fuse_amp"] = m["fuse_amp"]
         disc_flags = []
+        # TABLE vs ONE-LINE text disagreement (user, Wyer #915365: PV-3 BOM table 1x4P + 2x2P DC vs
+        # PV-5 one-line 2x 4-POLE DC) -> HARD flag naming both reads; the table is delivered.
+        def _sig_dc(l): return sorted(d["poles"] for d in l)
+        def _sig_ac(l): return sorted((d["amp"], bool(d.get("fused"))) for d in l)
+        for kind, t, c, sig in (("dc", tab_dc, co_dc, _sig_dc), ("ac", tab_ac, co_ac, _sig_ac)):
+            if t and c and sig(t) != sig(c):
+                disc_flags.append({
+                    "level": "HARD", "item": f"{kind}_disconnect_table_vs_oneline",
+                    "msg": f"{kind.upper()} disconnects disagree: PV-3 BOM table {sig(t)} vs PV-5 one-line "
+                           f"call-outs {sig(c)}. Delivered the table; confirm which is current."})
         for kind, fin, vis, src in (("ac", ac_final, vis_ac, "table" if tab_ac else "callout"),
                                     ("dc", dc_final, vis_dc, "table" if tab_dc else "callout")):
             if len(fin) != len(vis):

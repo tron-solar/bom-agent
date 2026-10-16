@@ -191,26 +191,36 @@ def disconnects_from_rows(rows) -> tuple[list[dict], list[dict]]:
 
 
 def disconnects_from_callouts(text: str) -> tuple[list[dict], list[dict]]:
-    """One-line text call-outs. A call-out must carry its rating on the same line (AC: amps; DC: poles)
-    so general notes ('AC DISCONNECT SHALL BE LOCKABLE') never count. Identical call-out lines are one
-    device each only if they appear on distinct lines; exact duplicates of a 'TYP.'/legend line are
-    ignored by de-duping lines that end in 'TYP'."""
+    """One-line (PV-5) text call-outs. CAD call-outs WRAP over several text lines ('NON-FUSED / 4-POLE DC /
+    DISCONNECT #1 / 600V, 32A'), so the page text is flattened and each call-out is matched as a phrase
+    that carries its rating (DC: poles; AC: amps). General notes ('AC DISCONNECT MUST BE ACCESSIBLE...')
+    carry no rating and never count; '(E)'/service disconnects are excluded."""
+    flat = " ".join(str(text or "").upper().split())
     ac, dc = [], []
-    for raw in (text or "").splitlines():
-        L = _clean(raw)
-        if ("DISCONNECT" not in L or "TYP" in L or "SHALL" in L or "NOTE" in L
-                or _is_existing_or_service(L)):
+    # --- DC: '4-POLE DC DISCONNECT' or 'DC DISCONNECT, 32A/600V, 2 POLE'
+    for m in re.finditer(r"(?:NON-FUSED\s+)?(\d)\s*-?\s*POLE\s+DC\s+DISCONNECT"
+                         r"|DC\s+DISCONNECT\s*,?\s*\d+\s*A\s*/\s*\d+\s*V\s*,?\s*(\d)\s*-?\s*POLE", flat):
+        pre = flat[max(0, m.start() - 12): m.start()]
+        if "(E)" in pre:
             continue
-        if "DC DISCONNECT" in L:
-            p = _poles(L)
-            if p:
-                dc.append({"poles": p, "source": "callout"})
-        elif "AC DISCONNECT" in L or "DISCONNECT" in L:
-            amp = _disco_amp(L)
-            if amp:
-                fused = _is_fused(L)
-                ac.append({"amp": amp, "fused": fused, "fuse_amp": _fuse_amp(L) if fused else None,
-                           "source": "callout"})
+        dc.append({"poles": int(m.group(1) or m.group(2)), "source": "callout"})
+    # --- AC: '<NON-FUSED|FUSED> [PV|PV/ESS] AC DISCONNECT 240V, 1PH, 3W 60A RATED' or '60A FUSED AC DISCONNECT'
+    pat_rated = re.compile(r"((?:NON-?\s?)?FUSED)\s+(?:PV/ESS\s+|PV\s+|ESS\s+)?AC\s+DISCONNECT\b"
+                           r".{0,30}?(?<!\d)(\d{2,3})\s*A\s+RATED")
+    pat_lead = re.compile(r"(?<![/\d])(\d{2,3})\s*A\s+((?:NON-?\s?)?FUSED)\s+(?:PV/ESS\s+|PV\s+|ESS\s+)?AC\s+DISCONNECT")
+    spans = []
+    for m in pat_rated.finditer(flat):
+        spans.append((m.start(), m.group(1), int(m.group(2))))
+    for m in pat_lead.finditer(flat):
+        if not any(abs(m.start() - s0) < 40 for s0, _, _ in spans):
+            spans.append((m.start(), m.group(2), int(m.group(1))))
+    for s0, fz, amp in sorted(spans):
+        ctx = flat[max(0, s0 - 12): s0 + 160]
+        if _is_existing_or_service(flat[max(0, s0 - 12): s0 + 40]):
+            continue
+        fused = not fz.replace(" ", "").startswith("NON")
+        fa = _fuse_amp(ctx) if fused else None
+        ac.append({"amp": amp, "fused": fused, "fuse_amp": fa, "source": "callout"})
     return ac, dc
 
 
