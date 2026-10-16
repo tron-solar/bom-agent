@@ -286,4 +286,22 @@ def test_qtron_435_row10_stamped():
 
 def test_module_master_note_mismatch_is_hard():
     _, flags, _ = _ee.solar_module("Q.TRON BLK M-G2.C+ 435W", 28, "(28) SIRIUS ELNSM54M-HC-N-450")
-    assert any(f["item"] == "module_plan_vs_master_note" and f["level"] == "HARD" for f in flags)
+    assert any(f["item"] == "module_plan_vs_master_note" and f["level"] == "NOTE" for f in flags)
+
+
+
+def _metal_only(at, att):
+    pl = _NS(module_quantity=20, electrical={"equipment_rows": [], "pv3_text": ""},
+             racking={"format": "roof_text", "attachment_type": at, "system_type": "roof",
+                      "roof": {"attachments": att, "rails": 10, "splice": 4, "mid_clamps": 20, "end_clamps": 16},
+                      "module_count": 20, "source": "test"})
+    return _orch._racking_block(pl)[0]
+
+
+def test_rail_clamp_metal_only_every_path():
+    r = _metal_only("S5_PROTEABRACKET", 48)
+    assert r[37] == 48 and r[46] == 48
+    r = _metal_only("S5_SOLARFOOT", 40)
+    assert r[38] == 40 and r[39] == 40 and r[46] == 40
+    r = _metal_only("K2_SHINGLE", 30)
+    assert r[33] == 30 and r[46] == 30

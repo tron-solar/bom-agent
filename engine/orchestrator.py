@@ -492,10 +492,6 @@ def _racking_block(planset):
                 flags.append({"level": "HARD", "item": "racking_attachment_sum_mismatch",
                               "msg": f"Per-type attachments {alloc} don't sum to the table total {att}."})
         k2 = alloc.get("K2_SHINGLE")
-        if alloc:
-            # K2 Rail Clamp (4000770, row 46) = ONE PER ATTACHMENT OF ANY TYPE (user, Wyer #915365:
-            # 32 K2 + 112 ProteaBracket -> 144), not K2-only.
-            rows[46] = sum(alloc.values())
         if k2:
             rows[33] = k2                                    # K2 Multimount shingle attachment
             mnt = _tt.k2_attach_mounting(_eq_rows)
@@ -508,6 +504,12 @@ def _racking_block(planset):
         if alloc.get("S5_SOLARFOOT"):
             rows[38] = alloc["S5_SOLARFOOT"]                 # SolarFoot
             rows[39] = alloc["S5_SOLARFOOT"]                 # separate L-foot, 1 per SolarFoot
+        # K2 Rail Clamp (4000770, row 46) = ONE PER ATTACHMENT OF ANY TYPE, on EVERY roof project — K2
+        # shingle, S-5! ProteaBracket, S-5! SolarFoot, or any mix (user, Wyer #915365 / metal-only jobs).
+        # Computed LAST from the attachment rows actually written, so no routing path can leave it blank.
+        _attach_total = rows.get(33, 0) + rows.get(37, 0) + rows.get(38, 0)
+        if _attach_total:
+            rows[46] = _attach_total
         if len(alloc) > 1:
             flags.append({"level": "NOTE", "item": "racking_mixed_attachments",
                           "msg": f"Mixed attachment types routed per BOM table line: {alloc}."})

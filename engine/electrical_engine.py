@@ -414,7 +414,8 @@ def module_note_crosscheck(module_pn, note_text):
     T = re.sub(r"[\s\-]+", "", str(note_text).upper())
     note_rows = {v for k, v in _MODULE_SKU_ROW.items() if _norm_module_sku(k) in T}
     if note_rows and plan_row is not None and plan_row not in note_rows:
-        return [{"level": "HARD", "item": "module_plan_vs_master_note",
+        # plan is the FIRST source of truth (user, 2026-10-16) -> review note only, never a hold
+        return [{"level": "NOTE", "item": "module_plan_vs_master_note",
                  "detail": f"Plan module {module_pn!r} (row {plan_row}) differs from the Master Note "
                            f"module (row(s) {sorted(note_rows)}). Confirm which module is being installed."}]
     return []
