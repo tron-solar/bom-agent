@@ -204,3 +204,53 @@ def test_wyer_oneline_callouts_wrapped_text():
 def test_moyes_oneline_fused_disconnect():
     ac, dc = tt.disconnects_from_callouts(_txt("fixtures_moyes_971010_pv5.pdf"))
     assert [(d["amp"], d["fused"]) for d in ac] == [(60, True)] and [d["poles"] for d in dc] == [4]
+
+
+# ---- round 4: rail clamp = all attachments, table truth vs call-outs, DC one-line overrules ----
+import engine.extractor as _ex
+
+
+def _racking_from(name):
+    p = os.path.join(_D, name)
+    t = _txt(name)
+    roof, _ = _ex.PlansetExtractor._parse_roof_racking_text(t)
+    _, at = _ex.PlansetExtractor._classify_attachment(t)
+    rows, _ = tt.equipment_rows(p)
+    pl = _NS(module_quantity=roof.get("modules"), electrical={"equipment_rows": rows, "pv3_text": t},
+             racking={"format": "roof_text", "attachment_type": at, "system_type": "roof", "roof": roof,
+                      "module_count": roof.get("modules"), "source": "test"})
+    r, f, _ = _orch._racking_block(pl)
+    return r, f
+
+
+def test_wyer_rail_clamp_is_one_per_attachment_any_type():
+    r, _ = _racking_from("fixtures_wyer_915365_pv3.pdf")
+    assert r[33] == 32 and r[37] == 112 and r[46] == 144 and r[35] == 128
+
+
+def test_moyes_rail_clamp_for_proteabracket_only():
+    r, _ = _racking_from("fixtures_moyes_971010_pv3.pdf")
+    assert r[37] == 61 and r[46] == 61 and 33 not in r
+
+
+def test_no_table_uses_callouts_with_soft_flag():
+    pl = _NS(module_quantity=42, electrical={"equipment_rows": [],
+             "pv3_text": "(32) K2 MULTIMOUNT ATTACHMENTS\n(DECK MOUNTED)\n(112) S-5! PROTEA BRACKET\nATTACHMENTS"},
+             racking={"format": "roof_text", "attachment_type": "S5_PROTEABRACKET", "system_type": "roof",
+                      "roof": {"attachments": None, "rails": 33, "splice": 16, "mid_clamps": 56, "end_clamps": 56},
+                      "module_count": 42, "source": "test"})
+    r, f, _ = _orch._racking_block(pl)
+    assert r[33] == 32 and r[37] == 112 and r[46] == 144
+    assert any(x["item"] == "racking_attachments_from_callouts" for x in f)
+
+
+def test_table_wins_over_short_callouts():
+    rows = [("ATTACHMENT", 40, "K2 MULTIMOUNT ATTACHMENTS"), ("ATTACHMENT", 100, "S-5! PROTEA BRACKET ATTACHMENTS")]
+    pl = _NS(module_quantity=42, electrical={"equipment_rows": rows,
+             "pv3_text": "(32) K2 MULTIMOUNT ATTACHMENTS\n(100) S-5! PROTEA BRACKET ATTACHMENTS"},
+             racking={"format": "roof_text", "attachment_type": "S5_PROTEABRACKET", "system_type": "roof",
+                      "roof": {"attachments": 140, "rails": 33, "splice": 16, "mid_clamps": 56, "end_clamps": 56},
+                      "module_count": 42, "source": "test"})
+    r, f, _ = _orch._racking_block(pl)
+    assert r[33] == 40 and r[37] == 100 and r[46] == 140
+    assert any(x["item"] == "racking_attachment_callout_crosscheck" for x in f)

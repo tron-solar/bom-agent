@@ -800,7 +800,7 @@ class PlansetExtractor:
             elif ("PROTEA" in L or "SOLARFOOT" in L or "SOLAR FOOT" in L
                   or (("ATTACHMENT" in label or "MULTIMOUNT" in L)
                       and "L FOOT" not in L and "L-FOOT" not in L)):
-                out["attachments"] = qty
+                out["attachments"] = (out["attachments"] or 0) + qty   # SUM: one line per attachment type
             elif label.startswith("RAIL") or "CROSSRAIL" in L:
                 out["rails"] = qty
             elif "SPLICE" in L:
@@ -1083,7 +1083,7 @@ class PlansetExtractor:
             elif ("PROTEA" in U or "SOLARFOOT" in U or "SOLAR FOOT" in U
                   or (("ATTACHMENT" in U or "MULTIMOUNT" in U)
                       and "L FOOT" not in U and "L-FOOT" not in U)):
-                out["attachments"] = qty
+                out["attachments"] = (out["attachments"] or 0) + qty   # SUM: one line per attachment type
             elif "RAIL" in U or "CROSSRAIL" in U:
                 out["rails"] = qty
             elif "SPLICE" in U:
@@ -1341,7 +1341,9 @@ class PlansetExtractor:
         tab_ac, tab_dc = _tt.disconnects_from_rows(eq_rows)
         co_ac, co_dc = _tt.disconnects_from_callouts(self._page_text(pdf_path, pv5_page))
         ac_final = tab_ac or co_ac
-        dc_final = tab_dc or co_dc
+        # DC disconnects: the PV-5 ONE-LINE call-outs OVERRULE the BOM table (user, Wyer #915365);
+        # the table is used only when the one-line names none.
+        dc_final = co_dc or tab_dc
         # a fused table row without a fuse size: take the fuse size from a matching one-line call-out
         for d in ac_final:
             if d.get("fused") and not d.get("fuse_amp"):
@@ -1354,12 +1356,16 @@ class PlansetExtractor:
         # PV-5 one-line 2x 4-POLE DC) -> HARD flag naming both reads; the table is delivered.
         def _sig_dc(l): return sorted(d["poles"] for d in l)
         def _sig_ac(l): return sorted((d["amp"], bool(d.get("fused"))) for d in l)
-        for kind, t, c, sig in (("dc", tab_dc, co_dc, _sig_dc), ("ac", tab_ac, co_ac, _sig_ac)):
-            if t and c and sig(t) != sig(c):
-                disc_flags.append({
-                    "level": "HARD", "item": f"{kind}_disconnect_table_vs_oneline",
-                    "msg": f"{kind.upper()} disconnects disagree: PV-3 BOM table {sig(t)} vs PV-5 one-line "
-                           f"call-outs {sig(c)}. Delivered the table; confirm which is current."})
+        if tab_dc and co_dc and _sig_dc(tab_dc) != _sig_dc(co_dc):
+            disc_flags.append({
+                "level": "NOTE", "item": "dc_disconnect_table_vs_oneline",
+                "msg": f"DC disconnects: PV-5 one-line {_sig_dc(co_dc)}-pole delivered (one-line overrules "
+                       f"DC); PV-3 BOM table listed {_sig_dc(tab_dc)}-pole."})
+        if tab_ac and co_ac and _sig_ac(tab_ac) != _sig_ac(co_ac):
+            disc_flags.append({
+                "level": "HARD", "item": "ac_disconnect_table_vs_oneline",
+                "msg": f"AC disconnects disagree: PV-3 BOM table {_sig_ac(tab_ac)} vs PV-5 one-line "
+                       f"call-outs {_sig_ac(co_ac)}. Delivered the table; confirm which is current."})
         for kind, fin, vis, src in (("ac", ac_final, vis_ac, "table" if tab_ac else "callout"),
                                     ("dc", dc_final, vis_dc, "table" if tab_dc else "callout")):
             if len(fin) != len(vis):

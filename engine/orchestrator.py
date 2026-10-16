@@ -460,11 +460,22 @@ def _racking_block(planset):
     # PER TYPE (e.g. 32 K2 Multimount deck-mounted + 112 S-5! ProteaBracket). Route every type's qty.
     from . import text_tables as _tt
     _eq_rows = ((getattr(planset, "electrical", None) or {}).get("equipment_rows")) or []
+    # ATTACHMENT QTY PER TYPE (user, 2026-10-16): the BILL OF MATERIALS table is TRUTH. The call-outs
+    # pointing at each roof/structure may not carry the full qty on multi-structure jobs, so they are a
+    # CROSS-CHECK only. With no table (most plans going forward) the call-outs are the only source ->
+    # delivered, but always flagged for review.
     by_type = {k: v for k, v in _tt.attachments_from_rows(_eq_rows).items() if k != "UNKNOWN"}
-    if not by_type:
-        # no BOM table (most plans going forward): roof-plan call-outs on PV-3
-        by_type = {k: v for k, v in _tt.attachments_from_callouts(
-            (getattr(planset, "electrical", None) or {}).get("pv3_text") or "").items() if k != "UNKNOWN"}
+    co_type = {k: v for k, v in _tt.attachments_from_callouts(
+        (getattr(planset, "electrical", None) or {}).get("pv3_text") or "").items() if k != "UNKNOWN"}
+    if by_type and co_type and co_type != by_type:
+        flags.append({"level": "NOTE", "item": "racking_attachment_callout_crosscheck",
+                      "msg": f"Attachment call-outs on the roof plan {co_type} differ from the BOM table "
+                             f"{by_type}; the table was delivered (truth). Verify."})
+    if not by_type and co_type:
+        by_type = co_type
+        flags.append({"level": "SOFT", "item": "racking_attachments_from_callouts",
+                      "msg": f"No BOM table: attachment quantities taken from roof-plan call-outs {co_type}. "
+                             f"Call-outs may not total every structure — verify the attachment counts."})
     if by_type and at not in ("K2_GROUND",) and system != "ground":
         at = at if at in by_type else next(iter(by_type))
     if at in ("K2_SHINGLE", "S5_PROTEABRACKET", "S5_SOLARFOOT"):
@@ -479,9 +490,12 @@ def _racking_block(planset):
                 flags.append({"level": "HARD", "item": "racking_attachment_sum_mismatch",
                               "msg": f"Per-type attachments {alloc} don't sum to the table total {att}."})
         k2 = alloc.get("K2_SHINGLE")
+        if alloc:
+            # K2 Rail Clamp (4000770, row 46) = ONE PER ATTACHMENT OF ANY TYPE (user, Wyer #915365:
+            # 32 K2 + 112 ProteaBracket -> 144), not K2-only.
+            rows[46] = sum(alloc.values())
         if k2:
             rows[33] = k2                                    # K2 Multimount shingle attachment
-            rows[46] = k2                                    # K2 rail clamp = K2 attachment qty (truth)
             mnt = _tt.k2_attach_mounting(_eq_rows)
             if mnt["rafter"] and mnt["rafter"] + mnt["deck"] == k2:
                 rows.update(re_eng.f_k2_shingle_screws(k2, mnt["deck"], mnt["rafter"]))
