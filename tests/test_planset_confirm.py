@@ -169,3 +169,17 @@ def test_list_project_files_stops_on_repeated_page(monkeypatch):
     client = cq.CoperniqClient(base="http://x", api_key="k")
     files = client.list_project_files("1")
     assert len(files) == 50  # got the page, detected no-progress, stopped
+
+
+
+def test_homeowner_goes_by_middle_name():
+    # Malone #9325: title 'Mitchell Daniel Malone', planset 'Daniel Malone REVA.pdf' -> MATCH
+    assert select_planset([_pdf("Daniel Malone REVA.pdf")], "Mitchell Daniel Malone").revision == "A"
+    # site plan with REV glued to extra words is NOT the planset
+    with pytest.raises(PlansetNotConfirmed):
+        select_planset([_pdf("Daniel Malone REVAsiteplan.pdf")], "Mitchell Daniel Malone")
+    # last name alone, or a non-name word, still rejected
+    with pytest.raises(PlansetNotConfirmed):
+        select_planset([_pdf("Malone REVA.pdf")], "Mitchell Daniel Malone")
+    with pytest.raises(PlansetNotConfirmed):
+        select_planset([_pdf("Daniel Smith REVA.pdf")], "Mitchell Daniel Malone")

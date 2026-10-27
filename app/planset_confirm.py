@@ -119,36 +119,52 @@ def _split_stem(filename: str) -> tuple[str, str]:
 def _convention_match(filename: str, first: str, last: str, all_tokens: list[str] | None = None) -> bool:
     """True iff the filename is '<homeowner name> REV<L>.pdf' for THIS customer.
 
-    Structural rules (user, Hicks #888564 / Collins #856179 / Harris #934388):
-      - name part must contain the customer's FIRST and LAST name tokens, in order;
-      - MIDDLE names/initials are allowed in either the title or the filename ("Roland Wayne Hicks",
-        "Tamara N Murphy"), as are title suffixes ("#2") that are stripped before matching;
-      - every filename name-token must belong to the customer's name (so 'Joseph Dare CAD REV A'
-        still does NOT match — extra non-name words are rejected);
-      - small typos tolerated per token (difflib ratio >= 0.85) so 'Jon' vs 'John' near-misses pass.
+    Structural rules (user, Hicks #888564 / Collins #856179 / Harris #934388 / Malone #9325):
+      - the filename's name part must END with the customer's LAST name;
+      - it must contain at least one of the customer's GIVEN names — first OR middle — because
+        homeowners often go by a middle name ('Mitchell Daniel Malone' -> 'Daniel Malone REVA.pdf');
+      - every filename name-token must belong to the customer's name, in the same order as the title
+        (so 'Joseph Dare CAD REV A' and 'Hicks Roland REVA' still do NOT match);
+      - title suffixes ('#2', '(PV)') are stripped before matching; single-letter initials are allowed;
+      - small typos tolerated per token (difflib ratio >= 0.85).
     Content confirmation (PV-1 homeowner name/address) remains the second-stage check."""
     import difflib
     name_part, rev = _split_stem(filename)
     if not rev or not name_part:
         return False
-    first_n, last_n = _norm(first), _norm(last)
-    if not first_n or not last_n:
+    last_n = _norm(last)
+    cust = list(all_tokens or [_norm(first), last_n])
+    if not cust or not last_n:
         return False
-    cust = set(all_tokens or [first_n, last_n])
+    given = cust[:-1] or [_norm(first)]
     ftoks = [t for t in name_part.split() if t not in _NAME_NOISE]
+    if len(ftoks) < 2:
+        return False
 
     def close(a, b):
         return a == b or (len(a) > 3 and difflib.SequenceMatcher(None, a, b).ratio() >= 0.85)
 
-    # every filename token must be part of the customer's name (no extra words like CAD/FINAL)
-    if not all(any(close(t, c) for c in cust) or len(t) == 1 for t in ftoks):
+    # last filename token is the last name
+    if not close(ftoks[-1], last_n):
         return False
-    try:
-        i_first = next(i for i, t in enumerate(ftoks) if close(t, first_n))
-        i_last = max(i for i, t in enumerate(ftoks) if close(t, last_n))
-    except (StopIteration, ValueError):
-        return False
-    return i_first < i_last
+    # every token maps to a customer token, in title order (initials match a given name's first letter)
+    pos = -1
+    has_given = False
+    for t in ftoks[:-1]:
+        idx = None
+        for j in range(pos + 1, len(cust) - 1):
+            c = cust[j]
+            if close(t, c) or (len(t) == 1 and c.startswith(t)):
+                idx = j
+                break
+        if idx is None:
+            if len(t) == 1:
+                continue        # a middle initial the Coperniq title doesn't carry ('Tamara N Murphy')
+            return False
+        pos = idx
+        if len(t) > 1 and cust[idx] in given:
+            has_given = True
+    return has_given
 
 
 def _split_name(customer_name: str) -> tuple[str, str]:
